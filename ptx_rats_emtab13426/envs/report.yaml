@@ -1,19 +1,10 @@
-# Downstream statistics and the R Markdown report.
+# Figures and HTML report (Python only, no R).
+name: report
 channels:
   - conda-forge
-  - bioconda
 dependencies:
-  - r-base=4.5
-  - bioconductor-phyloseq
-  - bioconductor-deseq2
-  - bioconductor-ancombc
-  - r-vegan
-  - r-ggplot2
-  - r-patchwork
-  - r-dplyr
-  - r-tidyr
-  - r-tibble
-  - r-readr
-  - r-knitr
-  - r-rmarkdown
-  - pandoc
+  - python=3.12
+  - pandas=2.3
+  - numpy=2.3
+  - matplotlib-base=3.10
+  - markdown=3.9

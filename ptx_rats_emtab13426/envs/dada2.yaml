@@ -1,4 +1,5 @@
 # DADA2 denoising, taxonomy and phyloseq object assembly.
+name: dada2
 channels:
   - conda-forge
   - bioconda

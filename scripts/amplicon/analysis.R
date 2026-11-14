@@ -1,17 +1,15 @@
----
-title: "Gut microbiota of paclitaxel-treated rats (E-MTAB-13426): 16S rRNA V3-V4 re-analysis"
-date: "`r format(Sys.Date())`"
-output:
-  html_document:
-    toc: true
-    toc_float: true
-    code_folding: hide
-    df_print: kable
----
+# Downstream statistics and figures for a 16S amplicon project (phyloseq object -> tables + plots).
+# Composition, alpha diversity, beta diversity (PERMANOVA, betadisper), differential abundance
+# at genus level (DESeq2 + ANCOM-BC2), taxa highlighted by the original study and a comparison
+# with the authors' processed genus table.
+#
+# Run by the `analysis` rule (Snakemake `script:`). Writes result tables to results/, figures to
+# plots/ and the R session to reports/sessionInfo.txt. The HTML report (report.py) only reads
+# these files. Blocks between `# <figure name="...">` and `# </figure>` are shown as code in
+# the report next to the figure of the same name.
+log <- file(snakemake@log[[1]], open = "wt")
+sink(log); sink(log, type = "message")
 
-```{r setup, include = FALSE}
-knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
-                      fig.width = 10, fig.height = 5, dpi = 120)
 suppressPackageStartupMessages({
   library(phyloseq)
   library(vegan)
@@ -29,16 +27,27 @@ suppressPackageStartupMessages({
 seed <- snakemake@params[["seed"]]
 set.seed(seed)
 threads <- snakemake@threads
-table_dir <- snakemake@output[["tables"]]
-dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
-save_table <- function(df, name) write_tsv(df, file.path(table_dir, paste0(name, ".tsv")))
+results_dir <- snakemake@params[["results_dir"]]
+plots_dir <- snakemake@params[["plots_dir"]]
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(plots_dir, recursive = TRUE, showWarnings = FALSE)
+da_q <- snakemake@params[["da_qvalue"]]
+min_prev <- snakemake@params[["min_prevalence"]]
+n_perm <- snakemake@params[["permutations"]]
+
+save_table <- function(df, name) write_tsv(df, file.path(results_dir, paste0(name, ".tsv")))
+save_plot <- function(p, name, width, height) {
+  ggsave(file.path(plots_dir, paste0(name, ".png")), p, width = width, height = height,
+         dpi = 120, bg = "white")
+}
+summary_rows <- list()
+add_summary <- function(key, value) summary_rows[[key]] <<- as.character(value)
 
 # Group colours: first three slots of the validated categorical palette
 # (all pairs pass colour-vision-deficiency checks).
 group_labels <- c(Control = "Control", PTX_WK2 = "PTX week 2", PTX_WK4 = "PTX week 4")
 group_cols <- c(Control = "#2a78d6", PTX_WK2 = "#eb6834", PTX_WK4 = "#1baf7a")
 scale_group_colour <- scale_colour_manual(values = group_cols, labels = group_labels, name = NULL)
-scale_group_fill <- scale_fill_manual(values = group_cols, labels = group_labels, name = NULL)
 # Eight categorical slots of the validated palette, plus a neutral grey for "Other".
 taxon_cols <- c("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948")
 other_col <- "#b5b4ae"
@@ -47,6 +56,7 @@ theme_set(theme_minimal(base_size = 12) +
                   panel.grid.major = element_line(colour = "grey92"),
                   legend.position = "top"))
 
+# ---------------------------------------------------------------- input and filtering
 ps_raw <- readRDS(snakemake@input[["ps"]])
 meta <- data.frame(sample_data(ps_raw)) %>% rownames_to_column("sample_id")
 
@@ -57,8 +67,21 @@ is_organelle <- (!is.na(tax_raw$Order) & tax_raw$Order == "Chloroplast") |
   (!is.na(tax_raw$Family) & tax_raw$Family == "Mitochondria")
 ps <- prune_taxa(taxa_names(ps_raw)[is_bact & !is_organelle], ps_raw)
 ps_rel <- transform_sample_counts(ps, function(x) x / sum(x))
-ps_rare <- rarefy_even_depth(ps, sample.size = min(sample_sums(ps)), rngseed = seed,
+depth <- min(sample_sums(ps))
+ps_rare <- rarefy_even_depth(ps, sample.size = depth, rngseed = seed,
                              replace = FALSE, verbose = FALSE)
+
+add_summary("asvs_total", ntaxa(ps_raw))
+add_summary("asvs_nonbacterial", sum(!is_bact))
+add_summary("asvs_organelle", sum(is_bact & is_organelle))
+add_summary("asvs_kept", ntaxa(ps))
+add_summary("reads_min", min(sample_sums(ps)))
+add_summary("reads_max", max(sample_sums(ps)))
+add_summary("reads_median", median(sample_sums(ps)))
+add_summary("rarefaction_depth", depth)
+add_summary("genus_assigned_pct", round(100 * mean(!is.na(tax_table(ps)[, "Genus"])), 1))
+add_summary("genus_assigned_reads_pct",
+            round(100 * sum(taxa_sums(ps)[!is.na(tax_table(ps)[, "Genus"])]) / sum(taxa_sums(ps)), 1))
 
 comparisons <- list(
   "Control vs PTX week 2" = list(groups = c("Control", "PTX_WK2"), paired = FALSE),
@@ -121,35 +144,36 @@ group_boxplot <- function(d, stats, ncol = 4, ylab = NULL) {
     labs(x = NULL, y = ylab) +
     theme(axis.text.x = element_text(angle = 30, hjust = 1), legend.position = "none")
 }
-```
 
-## Study design
+# ---------------------------------------------------------------- read tracking and depth
+track <- read_tsv(snakemake@input[["track"]], show_col_types = FALSE)
 
-Feces of male Sprague-Dawley rats were sequenced (16S rRNA V3-V4, Illumina MiSeq) by
-Zhong et al. (2023, *Cell Reports* 42:113386):
+# <figure name="read_tracking">
+p_track <- track %>% left_join(meta %>% select(sample = sample_id, group), by = "sample") %>%
+  select(sample, group, raw, primers_found, filtered, merged, nonchim) %>%
+  pivot_longer(raw:nonchim, names_to = "step", values_to = "reads") %>%
+  mutate(step = factor(step, levels = c("raw", "primers_found", "filtered", "merged", "nonchim"))) %>%
+  ggplot(aes(step, reads, group = sample, colour = group)) +
+  geom_line(alpha = 0.6) + geom_point(size = 1.4) +
+  scale_group_colour + scale_y_continuous(labels = scales::comma, limits = c(0, NA)) +
+  labs(x = NULL, y = "Read pairs")
+save_plot(p_track, "read_tracking", 9, 4.5)
+# </figure>
 
-* **Control**: 10 vehicle-treated rats, one sample each.
-* **PTX week 2 / PTX week 4**: 8 paclitaxel-treated rats, each sampled at both time points.
-  Week 2 vs week 4 is therefore a **paired** comparison (grey lines in the plots join the same
-  rat).
+# <figure name="rarefaction">
+otu <- as(otu_table(ps), "matrix")
+if (taxa_are_rows(ps)) otu <- t(otu)
+p_rare <- rarecurve(otu, step = 500, tidy = TRUE) %>%
+  left_join(meta, by = c(Site = "sample_id")) %>%
+  ggplot(aes(Sample, Species, group = Site, colour = group)) +
+  geom_line(linewidth = 0.6, alpha = 0.8) +
+  geom_vline(xintercept = depth, linetype = "dashed", colour = "grey50") +
+  scale_group_colour +
+  labs(x = "Reads sampled", y = "Observed ASVs", caption = "Dashed line: rarefaction depth")
+save_plot(p_rare, "rarefaction", 9, 4.5)
+# </figure>
 
-The authors deposited only relative-abundance tables. This report starts from the raw ENA reads
-(PRJEB67467) and uses DADA2 ASVs and SILVA 138.2. Processing details and quality control are in
-the [appendix](#appendix-processing-and-quality-control).
-
-> **Read with two caveats.**
->
-> 1. **Sequencing run = time point.** All week-4 samples were sequenced in a separate run
->    (2×250 bp). Control vs PTX week 2 is the only comparison free of run effects.
-> 2. **Week labels may be swapped.** The week 2 and week 4 labels in the raw data (used here)
->    are swapped relative to the authors' processed table (see
->    [label check](#sample-label-check)). "Week 4" here may be the paper's day 14.
-
-## Taxonomic composition
-
-### Group averages
-
-```{r composition-helpers}
+# ---------------------------------------------------------------- composition
 # Relative abundance per sample at a rank: top-n taxa by mean abundance, the rest pooled as
 # "Other"; taxa without an assignment at that rank are labelled "Unassigned".
 composition <- function(ps, rank, top_n = 8) {
@@ -169,6 +193,14 @@ taxon_fill <- function(lv) {
                     name = NULL)
 }
 
+phylum_df <- composition(ps, "Phylum")
+genus_df <- composition(ps, "Genus")
+save_table(bind_rows(phylum_df %>% mutate(rank = "Phylum"), genus_df %>% mutate(rank = "Genus")) %>%
+             group_by(rank, group, taxon) %>% summarise(mean_abundance = mean(abundance), .groups = "drop") %>%
+             arrange(rank, group, desc(mean_abundance)),
+           "composition_group_means")
+
+# <figure name="composition_group_means">
 plot_group_means <- function(df, title) {
   m <- df %>% group_by(group, taxon) %>% summarise(abundance = mean(abundance), .groups = "drop")
   # Stack positions are computed over all segments before hiding labels of small ones.
@@ -185,7 +217,11 @@ plot_group_means <- function(df, title) {
     labs(x = NULL, y = "Mean relative abundance", title = title) +
     theme(panel.grid.major.x = element_blank(), legend.position = "right")
 }
+save_plot(plot_group_means(phylum_df, "Phylum") + plot_group_means(genus_df, "Genus (top 8)"),
+          "composition_group_means", 12, 5.5)
+# </figure>
 
+# <figure name="composition_per_sample">
 plot_per_sample <- function(df, title) {
   ggplot(df, aes(Sample, abundance, fill = taxon)) +
     geom_col(width = 0.9, colour = "white", linewidth = 0.2) +
@@ -197,28 +233,11 @@ plot_per_sample <- function(df, title) {
     theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8),
           panel.grid.major.x = element_blank(), legend.position = "right")
 }
+save_plot(plot_per_sample(phylum_df, "Phylum") / plot_per_sample(genus_df, "Genus (top 8)"),
+          "composition_per_sample", 10, 9)
+# </figure>
 
-phylum_df <- composition(ps, "Phylum")
-genus_df <- composition(ps, "Genus")
-```
-
-```{r group-means, fig.height = 5.5, fig.width = 12}
-plot_group_means(phylum_df, "Phylum") + plot_group_means(genus_df, "Genus (top 8)")
-```
-
-### Per sample
-
-```{r per-sample-composition, fig.height = 9}
-plot_per_sample(phylum_df, "Phylum") / plot_per_sample(genus_df, "Genus (top 8)")
-```
-
-### Main phyla and the Bacillota/Bacteroidota ratio
-
-Each panel shows one phylum (or the log2 Bacillota/Bacteroidota ratio). Brackets show
-BH-adjusted Wilcoxon p-values. Control vs PTX uses the rank-sum test; week 2 vs week 4 uses the
-signed-rank test, paired by rat.
-
-```{r phyla-boxplots, fig.height = 7.5}
+# <figure name="phyla_boxplots">
 phyla <- phylum_df %>% filter(!taxon %in% c("Other", "Unassigned")) %>%
   group_by(taxon) %>% filter(mean(abundance) >= 0.005) %>% ungroup() %>%
   transmute(sample = Sample, group, rat, facet = as.character(taxon), value = 100 * abundance)
@@ -231,44 +250,27 @@ phyla_d <- bind_rows(phyla, fb) %>%
   mutate(facet = factor(facet, levels = c(sort(unique(phyla$facet)), "log2(Bacillota / Bacteroidota)")))
 phyla_stats <- phyla_d %>% group_by(facet) %>% group_modify(~ group_tests(.x)) %>% ungroup() %>%
   mutate(label = fmt_p(p_adj))
-save_table(phyla_stats %>% select(-label), "phylum_tests")
-group_boxplot(phyla_d, phyla_stats, ncol = 3, ylab = "Relative abundance (%) / log2 ratio")
-```
+save_plot(group_boxplot(phyla_d, phyla_stats, ncol = 3, ylab = "Relative abundance (%) / log2 ratio"),
+          "phyla_boxplots", 10, 7.5)
+# </figure>
+save_table(phyla_stats %>% rename(variable = facet) %>% select(-label), "phylum_tests")
 
-## Alpha diversity
-
-Samples are rarefied to the smallest library (`r min(sample_sums(ps))` reads). Brackets show
-BH-adjusted Wilcoxon p-values (rank-sum vs control; signed-rank, paired by rat, for week 2 vs
-week 4).
-
-```{r alpha, fig.height = 5}
+# ---------------------------------------------------------------- alpha diversity
+# <figure name="alpha_diversity">
 alpha <- estimate_richness(ps_rare, measures = c("Observed", "Chao1", "Shannon", "InvSimpson")) %>%
   mutate(sample_id = sample_names(ps_rare)) %>%
   left_join(meta, by = "sample_id") %>%
   select(sample = sample_id, group, rat, Observed, Chao1, Shannon, InvSimpson) %>%
   pivot_longer(c(Observed, Chao1, Shannon, InvSimpson), names_to = "facet", values_to = "value") %>%
   mutate(facet = factor(facet, levels = c("Observed", "Chao1", "Shannon", "InvSimpson")))
-save_table(alpha %>% rename(index = facet), "alpha_diversity")
 alpha_stats <- alpha %>% group_by(facet) %>% group_modify(~ group_tests(.x)) %>% ungroup() %>%
   mutate(label = fmt_p(p_adj))
+save_plot(group_boxplot(alpha, alpha_stats, ncol = 4), "alpha_diversity", 10, 5)
+# </figure>
+save_table(alpha %>% rename(index = facet), "alpha_diversity")
 save_table(alpha_stats %>% rename(index = facet) %>% select(-label), "alpha_diversity_tests")
-group_boxplot(alpha, alpha_stats, ncol = 4)
-```
 
-## Beta diversity
-
-Four distances:
-
-* **Bray-Curtis**: relative abundances.
-* **Jaccard**: presence/absence, rarefied.
-* **Unweighted UniFrac**: rarefied.
-* **Weighted UniFrac**: relative abundances.
-
-PERMANOVA (`adonis2`, 9,999 permutations) is run for each comparison separately. Permutations
-for week 2 vs week 4 are restricted within rats. `betadisper` tests whether groups differ in
-spread.
-
-```{r beta}
+# ---------------------------------------------------------------- beta diversity
 dists <- list(
   "Bray-Curtis" = phyloseq::distance(ps_rel, "bray"),
   "Jaccard" = phyloseq::distance(ps_rare, "jaccard", binary = TRUE),
@@ -276,16 +278,17 @@ dists <- list(
   "Weighted UniFrac" = phyloseq::UniFrac(ps_rel, weighted = TRUE)
 )
 
+# PERMANOVA per comparison; permutations restricted within rats for the paired comparison.
 permanova_one <- function(d, cmp) {
   m <- meta %>% filter(group %in% cmp$groups) %>% mutate(group = droplevels(group))
   dm <- as.dist(as.matrix(d)[m$sample_id, m$sample_id])
   set.seed(seed)
   fit <- if (cmp$paired) {
-    adonis2(dm ~ group, data = m, permutations = how(nperm = 9999, blocks = factor(m$rat)))
+    adonis2(dm ~ group, data = m, permutations = how(nperm = n_perm, blocks = factor(m$rat)))
   } else {
-    adonis2(dm ~ group, data = m, permutations = 9999)
+    adonis2(dm ~ group, data = m, permutations = n_perm)
   }
-  disp <- permutest(betadisper(dm, m$group), permutations = 9999)
+  disp <- permutest(betadisper(dm, m$group), permutations = n_perm)
   tibble(R2 = fit$R2[1], F = fit$F[1], p = fit$`Pr(>F)`[1], dispersion_p = disp$tab$`Pr(>F)`[1])
 }
 permanova <- expand_grid(distance = names(dists), comparison = names(comparisons)) %>%
@@ -294,14 +297,8 @@ permanova <- expand_grid(distance = names(dists), comparison = names(comparisons
   unnest(res) %>% ungroup() %>%
   mutate(p_adj = p.adjust(p, "BH"))
 save_table(permanova, "permanova")
-```
 
-### Ordination (PCoA)
-
-Each point is a sample. Grey segments join the same PTX rat at week 2 and week 4, large outlined
-points are group centroids, and dashed ellipses are 68% normal-theory regions.
-
-```{r pcoa, fig.height = 10}
+# <figure name="pcoa">
 pcoa_plot <- function(d, name) {
   ord <- cmdscale(d, k = 2, eig = TRUE)
   var_expl <- 100 * ord$eig[1:2] / sum(ord$eig[ord$eig > 0])
@@ -321,18 +318,13 @@ pcoa_plot <- function(d, name) {
          x = sprintf("PCoA1 (%.1f%%)", var_expl[1]), y = sprintf("PCoA2 (%.1f%%)", var_expl[2])) +
     theme(plot.subtitle = element_text(size = 9, colour = "grey30"))
 }
-wrap_plots(Map(pcoa_plot, dists, names(dists)), ncol = 2, guides = "collect") &
-  theme(legend.position = "top")
-```
+save_plot(wrap_plots(Map(pcoa_plot, dists, names(dists)), ncol = 2, guides = "collect") &
+            theme(legend.position = "top"),
+          "pcoa", 10, 10)
+# </figure>
 
-### Effect size across distances
-
-PERMANOVA R² is the fraction of between-sample variation explained by the grouping. Asterisks
-mark comparisons where `betadisper` finds unequal spread (p < 0.05). In those cases part of the
-effect may reflect dispersion rather than a shift in location.
-
-```{r permanova-heatmap, fig.height = 3.8}
-permanova %>%
+# <figure name="permanova_r2">
+p_r2 <- permanova %>%
   mutate(label = sprintf("R² = %.2f\n%s%s", R2, fmt_p(p_adj), ifelse(dispersion_p < 0.05, " *", "")),
          comparison = factor(comparison, levels = names(comparisons)),
          distance = factor(distance, levels = rev(names(dists)))) %>%
@@ -343,14 +335,10 @@ permanova %>%
   scale_colour_manual(values = c(`TRUE` = "white", `FALSE` = "grey15"), guide = "none") +
   labs(x = NULL, y = NULL) +
   theme(panel.grid = element_blank(), legend.position = "right")
-```
+save_plot(p_r2, "permanova_r2", 10, 3.8)
+# </figure>
 
-### Distance from the control community
-
-For every sample, this plot shows the mean Bray-Curtis dissimilarity to the 10 control samples
-(excluding itself). Values near 1 mean almost nothing is shared.
-
-```{r dist-to-control, fig.height = 4.5, fig.width = 6}
+# <figure name="distance_to_control">
 bc <- as.matrix(dists[["Bray-Curtis"]])
 ctrl_ids <- meta$sample_id[meta$group == "Control"]
 d2c <- meta %>% rowwise() %>%
@@ -358,26 +346,13 @@ d2c <- meta %>% rowwise() %>%
   transmute(sample = sample_id, group, rat, facet = "Bray-Curtis to controls", value)
 d2c_stats <- d2c %>% group_by(facet) %>% group_modify(~ group_tests(.x)) %>% ungroup() %>%
   mutate(label = fmt_p(p_adj))
-save_table(d2c_stats %>% select(-label), "distance_to_control_tests")
-group_boxplot(d2c, d2c_stats, ncol = 1, ylab = "Mean Bray-Curtis dissimilarity")
-```
+save_plot(group_boxplot(d2c, d2c_stats, ncol = 1, ylab = "Mean Bray-Curtis dissimilarity"),
+          "distance_to_control", 6, 4.5)
+# </figure>
+save_table(d2c %>% select(sample, group, rat, bray_curtis_to_controls = value), "distance_to_control")
+save_table(d2c_stats %>% select(-facet, -label), "distance_to_control_tests")
 
-## Differential abundance (genus level)
-
-ASVs are agglomerated to genus. Unassigned genera are labelled
-"<lowest assigned rank> (unclassified)". Each comparison is fitted on its own subset, keeping
-genera present in at least 25% of that subset. Two methods are used:
-
-* **DESeq2** (negative binomial, `poscounts`):
-  * `~ group` for Control vs PTX.
-  * `~ rat + group` for paired week 2 vs week 4.
-* **ANCOM-BC2** (bias-corrected log-linear model):
-  * `group` for Control vs PTX.
-  * `rat + group` for the paired comparison.
-
-Genera with BH q < 0.05 in **both** methods are treated as robust.
-
-```{r genus-table}
+# ---------------------------------------------------------------- differential abundance (genus)
 ps_genus <- tax_glom(ps, "Genus", NArm = FALSE)
 gtax <- as.data.frame(tax_table(ps_genus))
 genus_label <- apply(gtax[, c("Phylum", "Class", "Order", "Family", "Genus")], 1, function(r) {
@@ -387,8 +362,9 @@ genus_label <- apply(gtax[, c("Phylum", "Class", "Order", "Family", "Genus")], 1
 })
 taxa_names(ps_genus) <- make.unique(unname(genus_label))
 genus_phylum <- setNames(gtax$Phylum, taxa_names(ps_genus))
+add_summary("genera", ntaxa(ps_genus))
 
-prevalence_filter <- function(ps, min_prev = 0.25) {
+prevalence_filter <- function(ps) {
   counts <- as(otu_table(ps), "matrix")
   if (!taxa_are_rows(ps)) counts <- t(counts)
   prune_taxa(rowMeans(counts > 0) >= min_prev, ps)
@@ -403,23 +379,23 @@ subset_cmp <- function(cmp) {
 genus_rel <- psmelt(transform_sample_counts(ps_genus, function(x) x / sum(x))) %>%
   select(sample_id = Sample, genus = OTU, abundance = Abundance) %>%
   left_join(meta, by = "sample_id")
-```
+save_table(genus_rel %>% select(sample = sample_id, group, genus, relative_abundance = abundance) %>%
+             mutate(phylum = genus_phylum[genus]),
+           "genus_relative_abundance")
 
-```{r deseq2}
 run_deseq2 <- function(cmp, name) {
   p <- subset_cmp(cmp)
   dds <- phyloseq_to_deseq2(p, if (cmp$paired) ~ rat + group else ~ group)
   dds <- DESeq(dds, sfType = "poscounts", fitType = "local", quiet = TRUE)
-  res <- results(dds, name = resultsNames(dds)[length(resultsNames(dds))], alpha = 0.05)
+  res <- results(dds, name = resultsNames(dds)[length(resultsNames(dds))], alpha = da_q)
   as.data.frame(res) %>% rownames_to_column("genus") %>%
     transmute(comparison = name, genus, baseMean, log2FC = log2FoldChange, lfcSE,
               p = pvalue, q = padj)
 }
 deseq <- bind_rows(Map(run_deseq2, comparisons, names(comparisons)))
 save_table(deseq, "deseq2_genus")
-```
 
-```{r ancombc2}
+ancom_failed <- character(0)
 run_ancombc2 <- function(cmp, name) {
   p <- subset_cmp(cmp)
   counts <- as(otu_table(p), "matrix")
@@ -432,10 +408,13 @@ run_ancombc2 <- function(cmp, name) {
     ancombc2(data = counts, taxa_are_rows = TRUE, meta_data = data.frame(sample_data(p)),
              fix_formula = if (cmp$paired) "rat + group" else "group",
              p_adj_method = "BH", prv_cut = 0, lib_cut = 0, group = "group",
-             struc_zero = FALSE, neg_lb = FALSE, alpha = 0.05, global = FALSE,
+             struc_zero = FALSE, neg_lb = FALSE, alpha = da_q, global = FALSE,
              n_cl = threads, verbose = FALSE),
     error = function(e) { cat(name, ": ANCOM-BC2 failed: ", conditionMessage(e), "\n"); NULL })
-  if (is.null(fit)) return(NULL)
+  if (is.null(fit)) {
+    ancom_failed <<- c(ancom_failed, name)
+    return(NULL)
+  }
   r <- fit$res
   suffix <- sub("^lfc_", "", grep("^lfc_group", names(r), value = TRUE)[1])
   tibble(comparison = name, genus = r$taxon,
@@ -447,14 +426,16 @@ run_ancombc2 <- function(cmp, name) {
 }
 ancom <- bind_rows(Map(run_ancombc2, comparisons, names(comparisons)))
 save_table(ancom, "ancombc2_genus")
+add_summary("ancombc2_failed", paste(ancom_failed, collapse = "; "))
 
 da <- full_join(
   deseq %>% select(comparison, genus, log2FC_deseq2 = log2FC, p_deseq2 = p, q_deseq2 = q),
   ancom %>% select(comparison, genus, log2FC_ancombc2 = log2FC, q_ancombc2 = q, passed_sensitivity),
   by = c("comparison", "genus")
 ) %>%
-  mutate(sig_deseq2 = !is.na(q_deseq2) & q_deseq2 < 0.05,
-         sig_ancombc2 = !is.na(q_ancombc2) & q_ancombc2 < 0.05,
+  mutate(phylum = genus_phylum[genus],
+         sig_deseq2 = !is.na(q_deseq2) & q_deseq2 < da_q,
+         sig_ancombc2 = !is.na(q_ancombc2) & q_ancombc2 < da_q,
          called_by = case_when(sig_deseq2 & sig_ancombc2 ~ "both",
                                sig_deseq2 ~ "DESeq2 only",
                                sig_ancombc2 ~ "ANCOM-BC2 only",
@@ -466,18 +447,8 @@ save_table(da, "differential_abundance_genus")
 called_cols <- c("both" = "#2a78d6", "DESeq2 only" = "#eb6834", "ANCOM-BC2 only" = "#1baf7a",
                  "not significant" = "#c9c8c2")
 
-da %>% count(comparison, called_by) %>%
-  pivot_wider(names_from = called_by, values_from = n, values_fill = 0)
-```
-
-### Volcano plots
-
-Each point is a genus. The x axis is the DESeq2 fold change and the y axis its p-value. Colour
-shows which method(s) call the genus significant. The six most significant genera called by both
-methods are labelled in each panel.
-
-```{r volcano, fig.height = 6, fig.width = 13}
-ggplot(da %>% filter(!is.na(p_deseq2)), aes(log2FC_deseq2, -log10(p_deseq2), colour = called_by)) +
+# <figure name="volcano">
+p_volcano <- ggplot(da %>% filter(!is.na(p_deseq2)), aes(log2FC_deseq2, -log10(p_deseq2), colour = called_by)) +
   geom_vline(xintercept = 0, colour = "grey70") +
   geom_point(data = ~ filter(.x, called_by == "not significant"), size = 1.6, alpha = 0.7) +
   geom_point(data = ~ filter(.x, called_by != "not significant"), size = 2.4) +
@@ -485,47 +456,42 @@ ggplot(da %>% filter(!is.na(p_deseq2)), aes(log2FC_deseq2, -log10(p_deseq2), col
               slice_min(p_deseq2, n = 6) %>% ungroup(),
             aes(label = genus), size = 2.9, vjust = -0.8, colour = "grey15", check_overlap = TRUE) +
   facet_wrap(~ comparison, nrow = 1) +
-  scale_colour_manual(values = called_cols, name = "Significant (q < 0.05) in") +
+  scale_colour_manual(values = called_cols, name = sprintf("Significant (q < %s) in", da_q)) +
   scale_x_continuous(expand = expansion(mult = 0.12)) +
   labs(x = "log2 fold change (DESeq2); positive = higher in the second group",
        y = "-log10 p (DESeq2)")
-```
+save_plot(p_volcano, "volcano", 13, 6)
+# </figure>
 
-### Genera that differ between treatments
-
-These panels show relative abundance (log scale) of every genus called significant by **both**
-methods in at least one comparison. Brackets give the ANCOM-BC2 q-value for each comparison in
-which the genus was tested.
-
-```{r robust-genera, fig.height = 13, fig.width = 12}
 robust <- da %>% filter(called_by == "both") %>% distinct(genus) %>% pull(genus)
 if (length(robust) > 0) {
+  # <figure name="robust_genera">
   pseudo <- 1e-3  # percent; zeros are plotted at this floor
   rob_d <- genus_rel %>% filter(genus %in% robust) %>%
     transmute(sample = sample_id, group, rat, facet = genus, value = log10(100 * abundance + pseudo))
   rob_stats <- da %>% filter(genus %in% robust, !is.na(q_ancombc2)) %>%
     transmute(facet = genus, comparison = as.character(comparison),
               label = paste0(fmt_p(q_ancombc2, "q"), ifelse(called_by == "both", " *", "")))
-  # Order panels: largest Control vs week-4 change first.
+  # Order panels: largest ANCOM-BC2 fold change first.
   ord <- da %>% filter(genus %in% robust) %>% group_by(genus) %>%
     summarise(k = max(abs(log2FC_ancombc2), na.rm = TRUE)) %>% arrange(desc(k)) %>% pull(genus)
   rob_d$facet <- factor(rob_d$facet, levels = ord)
   rob_stats$facet <- factor(rob_stats$facet, levels = ord)
-  group_boxplot(rob_d, rob_stats, ncol = 5, ylab = "Relative abundance (%)") +
+  n_rows <- ceiling(length(robust) / 5)
+  p_rob <- group_boxplot(rob_d, rob_stats, ncol = 5, ylab = "Relative abundance (%)") +
     scale_y_continuous(breaks = log10(c(0, 0.01, 0.1, 1, 10, 100) + pseudo),
                        labels = c("0", "0.01", "0.1", "1", "10", "100"),
                        expand = expansion(mult = c(0.05, 0.22))) +
     labs(caption = "* significant in both DESeq2 and ANCOM-BC2. Zeros plotted at 0.001%.")
+  save_plot(p_rob, "robust_genera", 12, 1 + 2.6 * n_rows)
+  # </figure>
 }
-```
 
-### Fold changes of significant genera
-
-```{r da-plot, fig.height = 15}
 da_plot <- da %>% filter(called_by != "not significant") %>%
   mutate(log2FC = coalesce(log2FC_ancombc2, log2FC_deseq2))
 if (nrow(da_plot) > 0) {
-  ggplot(da_plot, aes(log2FC, reorder(genus, log2FC), colour = called_by)) +
+  # <figure name="da_fold_changes">
+  p_da <- ggplot(da_plot, aes(log2FC, reorder(genus, log2FC), colour = called_by)) +
     geom_vline(xintercept = 0, colour = "grey60") +
     geom_segment(aes(x = 0, xend = log2FC, yend = reorder(genus, log2FC)), linewidth = 0.5) +
     geom_point(size = 2.4) +
@@ -535,16 +501,11 @@ if (nrow(da_plot) > 0) {
     labs(x = "log2 fold change (ANCOM-BC2 when available, else DESeq2)\npositive = higher in the second group of the comparison",
          y = NULL) +
     theme(strip.text.y = element_text(angle = 0, hjust = 0))
+  save_plot(p_da, "da_fold_changes", 10, max(4, 1.5 + 0.16 * nrow(da_plot)))
+  # </figure>
 }
-```
 
-### Heatmap of the most abundant genera
-
-The 30 most abundant genera are shown, with each row scaled across samples (z-score of log10
-relative abundance). Blue marks below-average abundance for that genus and red above-average.
-Rows are clustered, and the bar on the left gives the phylum.
-
-```{r heatmap, fig.height = 9, fig.width = 12}
+# <figure name="heatmap_top_genera">
 top30 <- genus_rel %>% group_by(genus) %>% summarise(m = mean(abundance)) %>%
   slice_max(m, n = 30) %>% pull(genus)
 hm <- genus_rel %>% filter(genus %in% top30) %>%
@@ -577,30 +538,23 @@ p_phy <- ggplot(phy_df, aes(1, genus, fill = phylum)) +
   scale_x_continuous(expand = c(0, 0)) +
   labs(x = NULL, y = NULL) +
   theme(axis.text.x = element_blank(), panel.grid = element_blank(), legend.position = "left")
-p_phy + p_heat + plot_layout(widths = c(0.04, 1), guides = "collect")
-```
+save_plot(p_phy + p_heat + plot_layout(widths = c(0.04, 1), guides = "collect"),
+          "heatmap_top_genera", 12, 9)
+# </figure>
 
-## Taxa highlighted by the original study
-
-Zhong et al. report higher *Clostridium* and *Ruminococcus* on day 14. All SILVA genera whose
-names contain either term are shown, with Wilcoxon p-values (BH) as above.
-
-```{r paper-taxa, fig.height = 4.5}
+# ---------------------------------------------------------------- taxa highlighted by the study
+# <figure name="paper_taxa">
 focus <- genus_rel %>% filter(grepl("Clostridium|Ruminococcus", genus)) %>%
   group_by(genus) %>% filter(mean(abundance > 0) >= 0.25) %>% ungroup() %>%
   transmute(sample = sample_id, group, rat, facet = genus, value = 100 * abundance)
 focus_stats <- focus %>% group_by(facet) %>% group_modify(~ group_tests(.x)) %>% ungroup() %>%
   mutate(label = fmt_p(p_adj))
-group_boxplot(focus, focus_stats, ncol = 3, ylab = "Relative abundance (%)")
-```
+save_plot(group_boxplot(focus, focus_stats, ncol = 3, ylab = "Relative abundance (%)"),
+          "paper_taxa", 10, 1.5 + 3 * ceiling(n_distinct(focus$facet) / 3))
+# </figure>
+save_table(focus_stats %>% rename(genus = facet) %>% select(-label), "paper_taxa_tests")
 
-## Consistency with the authors' processed table
-
-The authors' genus table (Greengenes, relative abundance) is compared with this analysis for
-genera with the same name in both taxonomies. Unclassified groups are excluded, and SILVA suffixes
-are stripped before matching.
-
-```{r authors-compare, fig.height = 4.5, fig.width = 7}
+# ---------------------------------------------------------------- authors' processed table
 authors <- read.delim(snakemake@input[["authors_genus"]], check.names = FALSE)
 authors_long <- authors %>%
   mutate(genus = sub(".*g__", "", Taxon)) %>%
@@ -617,7 +571,13 @@ ours_long <- genus_rel %>%
   group_by(sample_id, genus) %>% summarise(ours = sum(abundance), .groups = "drop")
 both <- inner_join(authors_long, ours_long, by = c("sample_id", "genus"))
 mean_ab <- both %>% group_by(genus) %>% summarise(authors = mean(authors), ours = mean(ours))
-ggplot(mean_ab, aes(authors + 1e-5, ours + 1e-5)) +
+rho_means <- cor(mean_ab$authors, mean_ab$ours, method = "spearman")
+add_summary("authors_genera_matched", nrow(mean_ab))
+add_summary("authors_rho_means", round(rho_means, 2))
+save_table(mean_ab %>% rename(mean_authors = authors, mean_this_analysis = ours), "authors_comparison")
+
+# <figure name="authors_comparison">
+p_auth <- ggplot(mean_ab, aes(authors + 1e-5, ours + 1e-5)) +
   geom_abline(colour = "grey60", linetype = "dashed") +
   geom_point(colour = "#2a78d6", size = 2) +
   geom_text(data = slice_max(mean_ab, pmax(authors, ours), n = 10), aes(label = genus),
@@ -626,29 +586,19 @@ ggplot(mean_ab, aes(authors + 1e-5, ours + 1e-5)) +
   labs(x = "Mean relative abundance, authors (Greengenes)",
        y = "Mean relative abundance, this analysis (SILVA)",
        caption = sprintf("%d genera matched; Spearman rho of means = %.2f; dashed line: identity",
-                         nrow(mean_ab), cor(mean_ab$authors, mean_ab$ours, method = "spearman")))
-```
+                         nrow(mean_ab), rho_means))
+save_plot(p_auth, "authors_comparison", 7, 4.5)
+# </figure>
 
-### Sample label check
-
-Each sample here is correlated (Spearman, shared genera) with every sample of the authors'
-table.
-
-```{r label-check, fig.height = 6.5}
+# <figure name="label_check">
 wide_a <- authors_long %>% pivot_wider(names_from = sample_id, values_from = authors, values_fill = 0)
 wide_o <- ours_long %>% pivot_wider(names_from = sample_id, values_from = ours, values_fill = 0)
 shared <- intersect(wide_a$genus, wide_o$genus)
 A <- as.matrix(wide_a[match(shared, wide_a$genus), -1])
 O <- as.matrix(wide_o[match(shared, wide_o$genus), -1])
 cross <- cor(O, A, method = "spearman")
-best_match <- tibble(sample = rownames(cross),
-                     best_authors_sample = colnames(cross)[apply(cross, 1, which.max)],
-                     rho_best = round(apply(cross, 1, max), 2),
-                     rho_same_label = round(diag(cross[, rownames(cross)]), 2))
-save_table(best_match, "authors_label_check")
-
 ord <- c(paste0("C", 1:10), paste0("PTX", 1:8, "_WK2"), paste0("PTX", 1:8, "_WK4"))
-as.data.frame(cross) %>% rownames_to_column("ours") %>%
+p_label <- as.data.frame(cross) %>% rownames_to_column("ours") %>%
   pivot_longer(-ours, names_to = "authors", values_to = "rho") %>%
   mutate(ours = factor(ours, levels = rev(ord)), authors = factor(authors, levels = ord)) %>%
   ggplot(aes(authors, ours, fill = rho)) +
@@ -657,92 +607,14 @@ as.data.frame(cross) %>% rownames_to_column("ours") %>%
   labs(x = "Authors' table", y = "This analysis (labels from SDRF / file names)") +
   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1), panel.grid = element_blank(),
         legend.position = "right")
-```
+save_plot(p_label, "label_check", 10, 6.5)
+# </figure>
+best_match <- tibble(sample = rownames(cross),
+                     best_authors_sample = colnames(cross)[apply(cross, 1, which.max)],
+                     rho_best = round(apply(cross, 1, max), 2),
+                     rho_same_label = round(diag(cross[, rownames(cross)]), 2))
+save_table(best_match, "authors_label_check")
 
-> In 15 of 16 PTX samples, the best match is the **same rat at the other time point** in the
-> authors' table. The available data cannot tell which labelling is correct. This report keeps
-> the SDRF labels.
-
-## Appendix: processing and quality control
-
-### Pipeline
-
-1. cutadapt removes the primers. Some runs start R1 with the forward primer and others with the
-   reverse primer, so both orientations are tried.
-2. DADA2 learns error models per sequencing run × orientation batch, then merges pairs and
-   removes chimeras.
-3. ASVs are classified against SILVA 138.2.
-4. MAFFT and FastTree build a midpoint-rooted tree for UniFrac.
-
-```{r design}
-meta %>% count(group, seq_run, name = "samples") %>%
-  mutate(group = group_labels[as.character(group)],
-         seq_run = recode(seq_run, AG = "AG (MiSeq 2x300)", BD = "BD (MiSeq 2x250)"))
-```
-
-### Read tracking
-
-```{r tracking}
-track <- read_tsv(snakemake@input[["track"]], show_col_types = FALSE)
-save_table(track, "read_tracking")
-track
-```
-
-```{r tracking-plot, fig.height = 4.5}
-track %>% left_join(meta %>% select(sample = sample_id, group), by = "sample") %>%
-  select(sample, group, raw, primers_found, filtered, merged, nonchim) %>%
-  pivot_longer(raw:nonchim, names_to = "step", values_to = "reads") %>%
-  mutate(step = factor(step, levels = c("raw", "primers_found", "filtered", "merged", "nonchim"))) %>%
-  ggplot(aes(step, reads, group = sample, colour = group)) +
-  geom_line(alpha = 0.6) + geom_point(size = 1.4) +
-  scale_group_colour + scale_y_continuous(labels = scales::comma, limits = c(0, NA)) +
-  labs(x = NULL, y = "Read pairs")
-```
-
-### Quality profiles and error models
-
-```{r qc-images, results = "asis"}
-for (f in c(snakemake@input[["quality"]], snakemake@input[["errors"]])) {
-  cat(sprintf('<img src="%s" style="width:100%%; margin-bottom: 1em;" />\n\n', knitr::image_uri(f)))
-}
-```
-
-### ASV table and filtering
-
-```{r asv-summary}
-data.frame(
-  ASVs_total = ntaxa(ps_raw),
-  ASVs_removed_nonbacterial = sum(!is_bact),
-  ASVs_removed_organelle = sum(is_bact & is_organelle),
-  ASVs_kept = ntaxa(ps),
-  reads_min = min(sample_sums(ps)),
-  reads_max = max(sample_sums(ps)),
-  genus_assigned_pct = round(100 * mean(!is.na(tax_table(ps)[, "Genus"])), 1)
-)
-```
-
-```{r rarefaction, fig.height = 4.5}
-otu <- as(otu_table(ps), "matrix")
-if (taxa_are_rows(ps)) otu <- t(otu)
-rarecurve(otu, step = 500, tidy = TRUE) %>%
-  left_join(meta, by = c(Site = "sample_id")) %>%
-  ggplot(aes(Sample, Species, group = Site, colour = group)) +
-  geom_line(linewidth = 0.6, alpha = 0.8) +
-  geom_vline(xintercept = min(sample_sums(ps)), linetype = "dashed", colour = "grey50") +
-  scale_group_colour +
-  labs(x = "Reads sampled", y = "Observed ASVs", caption = "Dashed line: rarefaction depth")
-```
-
-### Quality notes
-
-* **High chimera rate.** About 55% of merged reads were removed as chimeras. DADA2 error rates
-  stay around 10⁻³–10⁻² even at Q38–40. Substitution rates that do not depend on quality point to
-  PCR errors from the second (TruSeq Nano) library PCR, not to sequencing errors. Between 6,500
-  and 15,000 reads per sample remain.
-* **Sequencing run.** All week-4 samples come from a separate 2×250 run.
-
-### Session info
-
-```{r session-info}
-sessionInfo()
-```
+# ---------------------------------------------------------------- run summary and session
+save_table(tibble(key = names(summary_rows), value = unlist(summary_rows)), "run_summary")
+writeLines(capture.output(sessionInfo()), snakemake@output[["session"]])

@@ -1,16 +1,20 @@
 # 16S rRNA (V3-V4) amplicon pipeline for E-MTAB-13426 (rat feces, paclitaxel vs vehicle).
-# Paths may use environment variables (e.g. $DATA); the Snakefile expands them.
+# Paths are relative to the project folder (ptx_rats_emtab13426/). Large files live under $DATA;
+# those paths may use environment variables, which the Snakefile expands.
 
-# ArrayExpress sample sheet (one row per FASTQ file, two per run). Shipped with the
+# ArrayExpress sample sheet (one row per FASTQ file, two per run). Copied from the
 # ArrayExpress download; also defines groups and time points.
-sdrf: "$DATA/Microbiota/PTX Zhong/E-MTAB-13426 feces PTX rats/E-MTAB-13426.sdrf.txt"
+sdrf: "data/E-MTAB-13426.sdrf.txt"
 
-# Authors' processed genus table (relative abundance, QIIME 1.8 / MOTHUR), used only for a
-# sanity-check comparison in the report.
-authors_genus_table: "$DATA/Microbiota/PTX Zhong/E-MTAB-13426 feces PTX rats/otu_table_genus.txt"
+# Authors' processed genus table (relative abundance, QIIME 1.8 / MOTHUR), from ArrayExpress.
+# Used only for a sanity-check comparison in the report.
+authors_genus_table: "data/otu_table_genus.txt"
 
-# Raw reads downloaded from ENA (PRJEB67467) are stored here, outside the repository.
+# Raw reads downloaded from ENA (PRJEB67467), outside the repository.
 fastq_dir: "$DATA/Microbiota/PTX Zhong/E-MTAB-13426 feces PTX rats/fastq"
+
+# Primer-trimmed and filtered FASTQ (intermediate, large), outside the repository.
+work_dir: "$DATA/Microbiota/PTX Zhong/E-MTAB-13426 feces PTX rats/work"
 
 # SILVA 138.2 formatted for DADA2 (https://zenodo.org/records/14169026).
 silva_dir: "$DATA/refdb/silva_138.2_dada2"
@@ -34,5 +38,10 @@ trunc_len_rev: 229
 max_ee_fwd: 2
 max_ee_rev: 2
 
-# Random seed for rarefaction and permutation tests.
+# Statistics.
+min_prevalence: 0.25   # genus kept for differential abundance if present in >= 25% of the compared samples
+da_qvalue: 0.05        # BH q-value cutoff, DESeq2 and ANCOM-BC2
+permutations: 9999     # PERMANOVA and betadisper
+
+# Random seed for rarefaction, DADA2 and permutation tests.
 seed: 2023
