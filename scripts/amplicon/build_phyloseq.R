@@ -18,9 +18,23 @@ stopifnot(identical(taxa$sequence, colnames(seqtab)), identical(taxa$asv, asv_id
 seqs <- DNAStringSet(colnames(seqtab)); names(seqs) <- asv_ids
 colnames(seqtab) <- asv_ids
 
+# Samples excluded in the config (e.g. unusable raw data) are dropped here: they stay in the read
+# tracking table but not in the phyloseq object.
+exclude <- unlist(snakemake@params[["exclude"]])
+if (length(exclude) > 0) {
+  stopifnot(all(exclude %in% rownames(seqtab)))
+  cat("Excluded samples:", exclude, "\n")
+  seqtab <- seqtab[!rownames(seqtab) %in% exclude, , drop = FALSE]
+  meta <- meta[!meta$sample %in% exclude, ]
+  # ASV names and sequences must stay in step with asvs.fasta and taxonomy.tsv.
+  stopifnot(all(colSums(seqtab) > 0))
+}
 rownames(meta) <- meta$sample
-meta$group <- factor(meta$group, levels = c("Control", "PTX_WK2", "PTX_WK4"))
-meta$week <- suppressWarnings(as.integer(meta$week))
+# Group levels in the order given in the config (first = reference group).
+group_levels <- names(snakemake@params[["groups"]])
+stopifnot(all(meta$group %in% group_levels))
+meta$group <- factor(meta$group, levels = group_levels)
+if ("week" %in% names(meta)) meta$week <- suppressWarnings(as.integer(meta$week))
 stopifnot(setequal(rownames(seqtab), rownames(meta)))
 
 tax_mat <- as.matrix(taxa[, c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")])

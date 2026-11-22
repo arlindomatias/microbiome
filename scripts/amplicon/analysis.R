@@ -7,7 +7,13 @@
 # plots/ and the R session to reports/sessionInfo.txt. The HTML report (report.py) only reads
 # these files. Blocks between `# <figure name="...">` and `# </figure>` are shown as code in
 # the report next to the figure of the same name.
-log <- file(snakemake@log[[1]], open = "wt")
+#
+# The study design comes from the config (through the rule's params): `groups` (ordered group
+# keys and labels; the first group is the reference for "distance to control"), `comparisons`
+# (name, two groups, paired or not), `subject` (metadata column identifying the individual;
+# paired comparisons match samples on it) and `paper_taxa` (regex of genera highlighted by the
+# original study).
+log <-file(snakemake@log[[1]], open = "wt")
 sink(log); sink(log, type = "message")
 
 suppressPackageStartupMessages({
@@ -34,8 +40,14 @@ dir.create(plots_dir, recursive = TRUE, showWarnings = FALSE)
 da_q <- snakemake@params[["da_qvalue"]]
 min_prev <- snakemake@params[["min_prevalence"]]
 n_perm <- snakemake@params[["permutations"]]
+subject_col <- snakemake@params[["subject"]]
+paper_taxa <- snakemake@params[["paper_taxa"]]
 
-save_table <- function(df, name) write_tsv(df, file.path(results_dir, paste0(name, ".tsv")))
+# Tables keep the project's own name for the subject column (e.g. "rat", "patient").
+save_table <- function(df, name) {
+  names(df)[names(df) == "subject"] <- subject_col
+  write_tsv(df, file.path(results_dir, paste0(name, ".tsv")))
+}
 save_plot <- function(p, name, width, height) {
   ggsave(file.path(plots_dir, paste0(name, ".png")), p, width = width, height = height,
          dpi = 120, bg = "white")
@@ -43,14 +55,16 @@ save_plot <- function(p, name, width, height) {
 summary_rows <- list()
 add_summary <- function(key, value) summary_rows[[key]] <<- as.character(value)
 
-# Group colours: first three slots of the validated categorical palette
-# (all pairs pass colour-vision-deficiency checks).
-group_labels <- c(Control = "Control", PTX_WK2 = "PTX week 2", PTX_WK4 = "PTX week 4")
-group_cols <- c(Control = "#2a78d6", PTX_WK2 = "#eb6834", PTX_WK4 = "#1baf7a")
-scale_group_colour <- scale_colour_manual(values = group_cols, labels = group_labels, name = NULL)
 # Eight categorical slots of the validated palette, plus a neutral grey for "Other".
 taxon_cols <- c("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948")
 other_col <- "#b5b4ae"
+# Group colours: the first slots of the same palette, in group order
+# (all pairs pass colour-vision-deficiency checks).
+group_labels <- unlist(snakemake@params[["groups"]])
+group_levels <- names(group_labels)
+ref_group <- group_levels[1]
+group_cols <- setNames(taxon_cols[seq_along(group_levels)], group_levels)
+scale_group_colour <- scale_colour_manual(values = group_cols, labels = group_labels, name = NULL)
 theme_set(theme_minimal(base_size = 12) +
             theme(panel.grid.minor = element_blank(),
                   panel.grid.major = element_line(colour = "grey92"),
@@ -58,7 +72,9 @@ theme_set(theme_minimal(base_size = 12) +
 
 # ---------------------------------------------------------------- input and filtering
 ps_raw <- readRDS(snakemake@input[["ps"]])
-meta <- data.frame(sample_data(ps_raw)) %>% rownames_to_column("sample_id")
+sample_data(ps_raw)$subject <- as.character(sample_data(ps_raw)[[subject_col]])
+stopifnot(identical(levels(sample_data(ps_raw)$group), group_levels))
+meta <-data.frame(sample_data(ps_raw)) %>% rownames_to_column("sample_id")
 
 # Keep bacteria only (drop Archaea, unclassified kingdom, chloroplast, mitochondria).
 tax_raw <- as.data.frame(tax_table(ps_raw))
@@ -83,25 +99,32 @@ add_summary("genus_assigned_pct", round(100 * mean(!is.na(tax_table(ps)[, "Genus
 add_summary("genus_assigned_reads_pct",
             round(100 * sum(taxa_sums(ps)[!is.na(tax_table(ps)[, "Genus"])]) / sum(taxa_sums(ps)), 1))
 
-comparisons <- list(
-  "Control vs PTX week 2" = list(groups = c("Control", "PTX_WK2"), paired = FALSE),
-  "Control vs PTX week 4" = list(groups = c("Control", "PTX_WK4"), paired = FALSE),
-  "PTX week 2 vs week 4 (paired)" = list(groups = c("PTX_WK2", "PTX_WK4"), paired = TRUE)
-)
+# Comparisons from the config: list(name, groups = c(first, second), paired). Fold changes are
+# second vs first group.
+comparisons <- lapply(snakemake@params[["comparisons"]], function(x)
+  list(groups = unlist(x[["groups"]]), paired = isTRUE(x[["paired"]])))
+names(comparisons) <- vapply(snakemake@params[["comparisons"]], function(x) x[["name"]], "")
+stopifnot(all(unlist(lapply(comparisons, `[[`, "groups")) %in% group_levels))
+# Subjects sampled more than once (joined by grey lines in the plots).
+has_pairs <- any(duplicated(meta$subject))
+# Samples ordered by group, then by the number in the subject name (C2 before C10).
+sample_order <- meta %>% arrange(group, as.integer(gsub("\\D", "", subject)), sample_id) %>% pull(sample_id)
+n_samples <- nrow(meta)
 
-# Three Wilcoxon tests per variable: rank-sum for Control vs each PTX time point,
-# signed-rank (paired by rat) for week 2 vs week 4; BH-adjusted within the variable.
+# One Wilcoxon test per comparison and variable: rank-sum for unpaired comparisons,
+# signed-rank (paired by subject) for paired ones; BH-adjusted within the variable.
 group_tests <- function(d) {
-  ctrl <- d$value[d$group == "Control"]
-  w2 <- d %>% filter(group == "PTX_WK2") %>% arrange(rat)
-  w4 <- d %>% filter(group == "PTX_WK4") %>% arrange(rat)
-  stopifnot(identical(w2$rat, w4$rat))
-  tibble(
-    comparison = names(comparisons),
-    p = c(wilcox.test(ctrl, w2$value, exact = FALSE)$p.value,
-          wilcox.test(ctrl, w4$value, exact = FALSE)$p.value,
-          wilcox.test(w2$value, w4$value, paired = TRUE, exact = FALSE)$p.value)
-  ) %>% mutate(p_adj = p.adjust(p, "BH"))
+  p <- vapply(comparisons, function(cmp) {
+    a <- d %>% filter(group == cmp$groups[1]) %>% arrange(subject)
+    b <- d %>% filter(group == cmp$groups[2]) %>% arrange(subject)
+    if (cmp$paired) {
+      stopifnot(identical(a$subject, b$subject))
+      wilcox.test(a$value, b$value, paired = TRUE, exact = FALSE)$p.value
+    } else {
+      wilcox.test(a$value, b$value, exact = FALSE)$p.value
+    }
+  }, numeric(1))
+  tibble(comparison = names(comparisons), p = unname(p)) %>% mutate(p_adj = p.adjust(p, "BH"))
 }
 
 fmt_p <- function(p, prefix = "p") {
@@ -110,10 +133,25 @@ fmt_p <- function(p, prefix = "p") {
                 paste0(prefix, " = ", trimws(formatC(signif(p, 2), format = "fg", digits = 2)))))
 }
 
-# Significance brackets on a three-group box plot (x = Control, PTX_WK2, PTX_WK4).
+# Significance brackets on a group box plot (x = groups in config order); short brackets are
+# drawn first (lowest), then longer ones above them.
 # stats: columns facet, comparison, label; values: columns facet, value (plotted scale).
-bracket_pos <- tibble(comparison = names(comparisons)[c(1, 3, 2)],
-                      x = c(1, 2, 1), xend = c(2, 3, 3), level = 1:3)
+bracket_pos <- tibble(
+  comparison = names(comparisons),
+  a = vapply(comparisons, function(cmp) match(cmp$groups[1], group_levels), 1L),
+  b = vapply(comparisons, function(cmp) match(cmp$groups[2], group_levels), 1L)
+) %>%
+  transmute(comparison, x = pmin(a, b), xend = pmax(a, b)) %>%
+  arrange(xend - x, x) %>% mutate(level = row_number())
+# Grey lines joining samples of the same subject (paired designs only).
+subject_lines <- function(geom, colour) {
+  if (!has_pairs) return(NULL)
+  geom(data = ~ .x %>% group_by(across(any_of("facet")), subject) %>% filter(n() > 1) %>%
+         ungroup() %>% arrange(subject, group),
+       aes(group = subject), colour = colour, linewidth = 0.4)
+}
+# Without repeated subjects, points are jittered so that large groups stay readable.
+point_position <- if (has_pairs) "identity" else position_jitter(width = 0.15, height = 0, seed = 1)
 add_brackets <- function(stats, values) {
   rng <- values %>% group_by(facet) %>%
     summarise(top = max(value, na.rm = TRUE),
@@ -129,13 +167,12 @@ add_brackets <- function(stats, values) {
   )
 }
 
-# Box plot of a per-sample value by group, PTX rats joined across time points.
+# Box plot of a per-sample value by group, samples of the same subject joined.
 group_boxplot <- function(d, stats, ncol = 4, ylab = NULL) {
   ggplot(d, aes(group, value, colour = group)) +
     geom_boxplot(outlier.shape = NA, width = 0.55, linewidth = 0.5) +
-    geom_line(data = ~ filter(.x, group != "Control"), aes(group = rat),
-              colour = "grey78", linewidth = 0.4) +
-    geom_point(size = 2) +
+    subject_lines(geom_line, "grey78") +
+    geom_point(size = 2, position = point_position, alpha = if (has_pairs) 1 else 0.75) +
     add_brackets(stats, d) +
     facet_wrap(~ facet, scales = "free_y", ncol = ncol, labeller = label_wrap_gen(width = 26)) +
     scale_group_colour +
@@ -146,7 +183,9 @@ group_boxplot <- function(d, stats, ncol = 4, ylab = NULL) {
 }
 
 # ---------------------------------------------------------------- read tracking and depth
-track <- read_tsv(snakemake@input[["track"]], show_col_types = FALSE)
+# Samples excluded in build_phyloseq (config exclude_samples) are left out of the plot.
+track <- read_tsv(snakemake@input[["track"]], show_col_types = FALSE) %>%
+  filter(sample %in% meta$sample_id)
 
 # <figure name="read_tracking">
 p_track <- track %>% left_join(meta %>% select(sample = sample_id, group), by = "sample") %>%
@@ -179,12 +218,12 @@ save_plot(p_rare, "rarefaction", 9, 4.5)
 composition <- function(ps, rank, top_n = 8) {
   df <- psmelt(tax_glom(transform_sample_counts(ps, function(x) x / sum(x)), rank, NArm = FALSE))
   df[[rank]] <- ifelse(is.na(df[[rank]]), "Unassigned", df[[rank]])
-  df <- df %>% group_by(Sample, group, rat, taxon = .data[[rank]]) %>%
+  df <- df %>% group_by(Sample, group, subject, taxon = .data[[rank]]) %>%
     summarise(abundance = sum(Abundance), .groups = "drop")
   top <- df %>% filter(taxon != "Unassigned") %>% group_by(taxon) %>%
     summarise(m = mean(abundance)) %>% slice_max(m, n = top_n) %>% pull(taxon)
   df %>% mutate(taxon = ifelse(taxon %in% top, taxon, "Other")) %>%
-    group_by(Sample, group, rat, taxon) %>%
+    group_by(Sample, group, subject, taxon) %>%
     summarise(abundance = sum(abundance), .groups = "drop") %>%
     mutate(taxon = factor(taxon, levels = c(top, "Other")))
 }
@@ -223,7 +262,7 @@ save_plot(plot_group_means(phylum_df, "Phylum") + plot_group_means(genus_df, "Ge
 
 # <figure name="composition_per_sample">
 plot_per_sample <- function(df, title) {
-  ggplot(df, aes(Sample, abundance, fill = taxon)) +
+  ggplot(df %>% mutate(Sample = factor(Sample, levels = sample_order)), aes(Sample, abundance, fill = taxon)) +
     geom_col(width = 0.9, colour = "white", linewidth = 0.2) +
     facet_grid(~ group, scales = "free_x", space = "free_x",
                labeller = as_labeller(group_labels)) +
@@ -234,17 +273,17 @@ plot_per_sample <- function(df, title) {
           panel.grid.major.x = element_blank(), legend.position = "right")
 }
 save_plot(plot_per_sample(phylum_df, "Phylum") / plot_per_sample(genus_df, "Genus (top 8)"),
-          "composition_per_sample", 10, 9)
+          "composition_per_sample", max(10, 3 + 0.12 * n_samples), 9)
 # </figure>
 
 # <figure name="phyla_boxplots">
 phyla <- phylum_df %>% filter(!taxon %in% c("Other", "Unassigned")) %>%
   group_by(taxon) %>% filter(mean(abundance) >= 0.005) %>% ungroup() %>%
-  transmute(sample = Sample, group, rat, facet = as.character(taxon), value = 100 * abundance)
+  transmute(sample = Sample, group, subject, facet = as.character(taxon), value = 100 * abundance)
 fb <- phylum_df %>% filter(taxon %in% c("Bacillota", "Bacteroidota")) %>%
-  select(Sample, group, rat, taxon, abundance) %>%
+  select(Sample, group, subject, taxon, abundance) %>%
   pivot_wider(names_from = taxon, values_from = abundance) %>%
-  transmute(sample = Sample, group, rat, facet = "log2(Bacillota / Bacteroidota)",
+  transmute(sample = Sample, group, subject, facet = "log2(Bacillota / Bacteroidota)",
             value = log2(Bacillota / Bacteroidota))
 phyla_d <- bind_rows(phyla, fb) %>%
   mutate(facet = factor(facet, levels = c(sort(unique(phyla$facet)), "log2(Bacillota / Bacteroidota)")))
@@ -260,7 +299,7 @@ save_table(phyla_stats %>% rename(variable = facet) %>% select(-label), "phylum_
 alpha <- estimate_richness(ps_rare, measures = c("Observed", "Chao1", "Shannon", "InvSimpson")) %>%
   mutate(sample_id = sample_names(ps_rare)) %>%
   left_join(meta, by = "sample_id") %>%
-  select(sample = sample_id, group, rat, Observed, Chao1, Shannon, InvSimpson) %>%
+  select(sample = sample_id, group, subject, Observed, Chao1, Shannon, InvSimpson) %>%
   pivot_longer(c(Observed, Chao1, Shannon, InvSimpson), names_to = "facet", values_to = "value") %>%
   mutate(facet = factor(facet, levels = c("Observed", "Chao1", "Shannon", "InvSimpson")))
 alpha_stats <- alpha %>% group_by(facet) %>% group_modify(~ group_tests(.x)) %>% ungroup() %>%
@@ -284,7 +323,7 @@ permanova_one <- function(d, cmp) {
   dm <- as.dist(as.matrix(d)[m$sample_id, m$sample_id])
   set.seed(seed)
   fit <- if (cmp$paired) {
-    adonis2(dm ~ group, data = m, permutations = how(nperm = n_perm, blocks = factor(m$rat)))
+    adonis2(dm ~ group, data = m, permutations = how(nperm = n_perm, blocks = factor(m$subject)))
   } else {
     adonis2(dm ~ group, data = m, permutations = n_perm)
   }
@@ -307,8 +346,7 @@ pcoa_plot <- function(d, name) {
   st <- permanova %>% filter(distance == name) %>%
     mutate(txt = sprintf("%s: R² = %.2f, %s", sub(" \\(paired\\)", "", comparison), R2, fmt_p(p_adj)))
   ggplot(df, aes(X1, X2, colour = group)) +
-    geom_path(data = ~ filter(.x, group != "Control") %>% arrange(rat, group),
-              aes(group = rat), colour = "grey82", linewidth = 0.4) +
+    subject_lines(geom_path, "grey82") +
     stat_ellipse(level = 0.68, linewidth = 0.5, linetype = "dashed") +
     geom_point(size = 2.4, alpha = 0.9) +
     geom_point(data = cent, size = 6, shape = 21, fill = group_cols[as.character(cent$group)],
@@ -340,16 +378,16 @@ save_plot(p_r2, "permanova_r2", 10, 3.8)
 
 # <figure name="distance_to_control">
 bc <- as.matrix(dists[["Bray-Curtis"]])
-ctrl_ids <- meta$sample_id[meta$group == "Control"]
+ctrl_ids <- meta$sample_id[meta$group == ref_group]
 d2c <- meta %>% rowwise() %>%
   mutate(value = mean(bc[sample_id, setdiff(ctrl_ids, sample_id)])) %>% ungroup() %>%
-  transmute(sample = sample_id, group, rat, facet = "Bray-Curtis to controls", value)
+  transmute(sample = sample_id, group, subject, facet = "Bray-Curtis to controls", value)
 d2c_stats <- d2c %>% group_by(facet) %>% group_modify(~ group_tests(.x)) %>% ungroup() %>%
   mutate(label = fmt_p(p_adj))
 save_plot(group_boxplot(d2c, d2c_stats, ncol = 1, ylab = "Mean Bray-Curtis dissimilarity"),
           "distance_to_control", 6, 4.5)
 # </figure>
-save_table(d2c %>% select(sample, group, rat, bray_curtis_to_controls = value), "distance_to_control")
+save_table(d2c %>% select(sample, group, subject, bray_curtis_to_controls = value), "distance_to_control")
 save_table(d2c_stats %>% select(-facet, -label), "distance_to_control_tests")
 
 # ---------------------------------------------------------------- differential abundance (genus)
@@ -372,7 +410,7 @@ prevalence_filter <- function(ps) {
 subset_cmp <- function(cmp) {
   p <- prune_samples(meta$sample_id[meta$group %in% cmp$groups], ps_genus)
   sample_data(p)$group <- droplevels(sample_data(p)$group)
-  sample_data(p)$rat <- factor(sample_data(p)$rat)
+  sample_data(p)$subject <- factor(sample_data(p)$subject)
   prevalence_filter(p)
 }
 
@@ -385,7 +423,7 @@ save_table(genus_rel %>% select(sample = sample_id, group, genus, relative_abund
 
 run_deseq2 <- function(cmp, name) {
   p <- subset_cmp(cmp)
-  dds <- phyloseq_to_deseq2(p, if (cmp$paired) ~ rat + group else ~ group)
+  dds <- phyloseq_to_deseq2(p, if (cmp$paired) ~ subject + group else ~ group)
   dds <- DESeq(dds, sfType = "poscounts", fitType = "local", quiet = TRUE)
   res <- results(dds, name = resultsNames(dds)[length(resultsNames(dds))], alpha = da_q)
   as.data.frame(res) %>% rownames_to_column("genus") %>%
@@ -402,11 +440,11 @@ run_ancombc2 <- function(cmp, name) {
   if (!taxa_are_rows(p)) counts <- t(counts)
   set.seed(seed)
   # Count matrix + metadata input (a phyloseq input would need the 'microbiome' package).
-  # Paired design: rat as a fixed effect (a random intercept cannot be fitted with two
-  # observations per rat).
+  # Paired design: subject as a fixed effect (a random intercept cannot be fitted with two
+  # observations per subject).
   fit <- tryCatch(
     ancombc2(data = counts, taxa_are_rows = TRUE, meta_data = data.frame(sample_data(p)),
-             fix_formula = if (cmp$paired) "rat + group" else "group",
+             fix_formula = if (cmp$paired) "subject + group" else "group",
              p_adj_method = "BH", prv_cut = 0, lib_cut = 0, group = "group",
              struc_zero = FALSE, neg_lb = FALSE, alpha = da_q, global = FALSE,
              n_cl = threads, verbose = FALSE),
@@ -468,7 +506,7 @@ if (length(robust) > 0) {
   # <figure name="robust_genera">
   pseudo <- 1e-3  # percent; zeros are plotted at this floor
   rob_d <- genus_rel %>% filter(genus %in% robust) %>%
-    transmute(sample = sample_id, group, rat, facet = genus, value = log10(100 * abundance + pseudo))
+    transmute(sample = sample_id, group, subject, facet = genus, value = log10(100 * abundance + pseudo))
   rob_stats <- da %>% filter(genus %in% robust, !is.na(q_ancombc2)) %>%
     transmute(facet = genus, comparison = as.character(comparison),
               label = paste0(fmt_p(q_ancombc2, "q"), ifelse(called_by == "both", " *", "")))
@@ -514,7 +552,6 @@ hm <- genus_rel %>% filter(genus %in% top30) %>%
 zmat <- hm %>% select(genus, sample_id, z) %>% pivot_wider(names_from = sample_id, values_from = z) %>%
   column_to_rownames("genus") %>% as.matrix()
 row_order <- rownames(zmat)[hclust(dist(zmat), method = "average")$order]
-sample_order <- meta %>% arrange(group, as.integer(gsub("\\D", "", rat))) %>% pull(sample_id)
 hm <- hm %>% mutate(genus = factor(genus, levels = row_order),
                     sample_id = factor(sample_id, levels = sample_order),
                     z = pmax(pmin(z, 2.5), -2.5))
@@ -539,14 +576,14 @@ p_phy <- ggplot(phy_df, aes(1, genus, fill = phylum)) +
   labs(x = NULL, y = NULL) +
   theme(axis.text.x = element_blank(), panel.grid = element_blank(), legend.position = "left")
 save_plot(p_phy + p_heat + plot_layout(widths = c(0.04, 1), guides = "collect"),
-          "heatmap_top_genera", 12, 9)
+          "heatmap_top_genera", max(12, 4 + 0.12 * n_samples), 9)
 # </figure>
 
 # ---------------------------------------------------------------- taxa highlighted by the study
 # <figure name="paper_taxa">
-focus <- genus_rel %>% filter(grepl("Clostridium|Ruminococcus", genus)) %>%
+focus <- genus_rel %>% filter(grepl(paper_taxa, genus)) %>%
   group_by(genus) %>% filter(mean(abundance > 0) >= 0.25) %>% ungroup() %>%
-  transmute(sample = sample_id, group, rat, facet = genus, value = 100 * abundance)
+  transmute(sample = sample_id, group, subject, facet = genus, value = 100 * abundance)
 focus_stats <- focus %>% group_by(facet) %>% group_modify(~ group_tests(.x)) %>% ungroup() %>%
   mutate(label = fmt_p(p_adj))
 save_plot(group_boxplot(focus, focus_stats, ncol = 3, ylab = "Relative abundance (%)"),
@@ -555,13 +592,27 @@ save_plot(group_boxplot(focus, focus_stats, ncol = 3, ylab = "Relative abundance
 save_table(focus_stats %>% rename(genus = facet) %>% select(-label), "paper_taxa_tests")
 
 # ---------------------------------------------------------------- authors' processed table
-authors <- read.delim(snakemake@input[["authors_genus"]], check.names = FALSE)
+# First column: taxon (full Greengenes lineage or genus name); one column per sample with
+# relative abundances. The file may be UTF-16 (byte-order mark), as exported by Excel.
+read_authors <- function(path) {
+  bom <- readBin(path, "raw", 2)
+  enc <- if (identical(bom, as.raw(c(0xff, 0xfe))) || identical(bom, as.raw(c(0xfe, 0xff)))) "UTF-16" else ""
+  d <- read.delim(path, check.names = FALSE, fileEncoding = enc, blank.lines.skip = TRUE)
+  names(d)[1] <- "Taxon"
+  d %>% filter(!is.na(Taxon), Taxon != "")
+}
+# Greengenes names in brackets ([Ruminococcus], [Prevotella], [Eubacterium]) are taxa placed in
+# another family by later taxonomies, so they are not matched to the SILVA genus of the same
+# name. Greengenes "Shigella" corresponds to SILVA "Escherichia-Shigella".
+authors_synonyms <- c(Shigella = "Escherichia-Shigella", Escherichia = "Escherichia-Shigella")
+authors <- read_authors(snakemake@input[["authors_genus"]])
 authors_long <- authors %>%
   mutate(genus = sub(".*g__", "", Taxon)) %>%
-  filter(!grepl("^Unclassified|^$", genus)) %>%
+  filter(!grepl("^Unclassified|^$|^\\[", genus)) %>%
+  mutate(genus = coalesce(authors_synonyms[genus], genus)) %>%
   select(-Taxon) %>%
   pivot_longer(-genus, names_to = "sample_id", values_to = "authors") %>%
-  mutate(sample_id = gsub(".", "_", sample_id, fixed = TRUE), genus = gsub("\\[|\\]", "", genus)) %>%
+  mutate(sample_id = gsub(".", "_", sample_id, fixed = TRUE)) %>%
   group_by(sample_id, genus) %>% summarise(authors = sum(authors), .groups = "drop")
 ours_long <- genus_rel %>%
   filter(!grepl("unclassified", genus)) %>%
@@ -597,22 +648,26 @@ shared <- intersect(wide_a$genus, wide_o$genus)
 A <- as.matrix(wide_a[match(shared, wide_a$genus), -1])
 O <- as.matrix(wide_o[match(shared, wide_o$genus), -1])
 cross <- cor(O, A, method = "spearman")
-ord <- c(paste0("C", 1:10), paste0("PTX", 1:8, "_WK2"), paste0("PTX", 1:8, "_WK4"))
+ord_o <- c(intersect(sample_order, rownames(cross)), setdiff(rownames(cross), sample_order))
+ord_a <- c(intersect(sample_order, colnames(cross)), setdiff(colnames(cross), sample_order))
 p_label <- as.data.frame(cross) %>% rownames_to_column("ours") %>%
   pivot_longer(-ours, names_to = "authors", values_to = "rho") %>%
-  mutate(ours = factor(ours, levels = rev(ord)), authors = factor(authors, levels = ord)) %>%
+  mutate(ours = factor(ours, levels = rev(ord_o)), authors = factor(authors, levels = ord_a)) %>%
   ggplot(aes(authors, ours, fill = rho)) +
   geom_tile(colour = "white", linewidth = 0.3) +
   scale_fill_gradient(low = "#f4f3ef", high = "#104281", name = "Spearman rho") +
   labs(x = "Authors' table", y = "This analysis (labels from SDRF / file names)") +
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1), panel.grid = element_blank(),
-        legend.position = "right")
-save_plot(p_label, "label_check", 10, 6.5)
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1,
+                                   size = if (n_samples > 40) 6 else NULL),
+        axis.text.y = element_text(size = if (n_samples > 40) 6 else NULL),
+        panel.grid = element_blank(), legend.position = "right")
+save_plot(p_label, "label_check", max(10, 3 + 0.12 * n_samples), max(6.5, 1.5 + 0.11 * n_samples))
 # </figure>
 best_match <- tibble(sample = rownames(cross),
                      best_authors_sample = colnames(cross)[apply(cross, 1, which.max)],
                      rho_best = round(apply(cross, 1, max), 2),
-                     rho_same_label = round(diag(cross[, rownames(cross)]), 2))
+                     rho_same_label = round(vapply(rownames(cross), function(s)
+                       if (s %in% colnames(cross)) cross[s, s] else NA_real_, 1), 2))
 save_table(best_match, "authors_label_check")
 
 # ---------------------------------------------------------------- run summary and session

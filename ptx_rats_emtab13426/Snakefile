@@ -95,7 +95,7 @@ rule download_fastq:
             url=$(echo "$urls" | cut -d';' -f$i)
             md5=$(echo "$md5s" | cut -d';' -f$i)
             out="$(dirname {output.r1:q})/{wildcards.run}_$i.fastq.gz"
-            curl -sf --retry 3 -o "$out" "https://$url"
+            curl -sf --retry 3 --speed-limit 1024 --speed-time 60 -o "$out" "https://$url"
             echo "$md5  $out" | md5sum -c - >&2
         done
         """
@@ -164,7 +164,7 @@ rule cutadapt:
     log: "logs/cutadapt/{sample}.log"
     shell:
         "bash {input.script} {input.r1:q} {input.r2:q} {params.fwd} {params.rev} "
-        "{output.fwd} {output.rev} {output.json} {threads} > {log} 2>&1"
+        "{output.fwd:q} {output.rev:q} {output.json:q} {threads} > {log:q} 2>&1"
 
 
 rule quality_profiles:
@@ -214,6 +214,7 @@ rule dada2_denoise:
     params:
         samples=list(SAMPLES),
         seq_runs=[d["seq_run"] for d in SAMPLES.values()],
+        error_function=config["error_function"],
         seed=config["seed"],
     threads: 8
     conda: "envs/dada2.yaml"
@@ -263,6 +264,9 @@ rule build_phyloseq:
     output:
         ps="data/ps.rds",
         counts="results/asv_counts.tsv",
+    params:
+        groups=config["groups"],
+        exclude=list(config.get("exclude_samples", {})),
     threads: 1
     conda: "envs/dada2.yaml"
     log: "logs/build_phyloseq/phyloseq.log"
@@ -301,6 +305,10 @@ rule analysis:
         min_prevalence=config["min_prevalence"],
         da_qvalue=config["da_qvalue"],
         permutations=config["permutations"],
+        groups=config["groups"],
+        comparisons=config["comparisons"],
+        subject=config["subject_column"],
+        paper_taxa=config["paper_taxa"],
     threads: 4
     conda: "envs/analysis.yaml"
     log: "logs/analysis/analysis.log"
@@ -334,6 +342,25 @@ acid*, [*Cell Reports* 42:113386](https://doi.org/10.1016/j.celrep.2023.113386).
 
 The authors deposited only relative-abundance tables. This analysis starts from the raw reads and produces
 ASV **counts**, which allow count-based methods (Chao1, DESeq2, ANCOM-BC2, rarefaction).
+""",
+        groups_text="""
+* **Control**: vehicle-treated rats, one sample each.
+* **PTX week 2 / PTX week 4**: paclitaxel-treated rats, each sampled at both time points.
+""",
+        read_notes="""
+* **Two read lengths:** the 2×250 run gives ~225/231 bp reads after primer removal. Truncation is set to
+  220/229 bp for all samples, which leaves ~20 bp of overlap on the ~429 bp amplicon.
+""",
+        error_notes="""
+Aggregate quality profiles of the primer-trimmed reads were used to choose the truncation lengths. DADA2 error
+rates stay around 10⁻³–10⁻² even at Q38–40. Substitution rates that do not depend on quality point to PCR errors
+from the second (TruSeq Nano) library PCR rather than to sequencing errors, which fits the high chimera rate.
+""",
+        paper_taxa_text="""
+Zhong et al. report higher *Clostridium* and *Ruminococcus* on day 14.
+""",
+        label_notes="""
+The available data cannot tell which labelling is correct. This report keeps the SDRF labels.
 """,
         notes="""
 > **Read with two caveats.**

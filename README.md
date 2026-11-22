@@ -7,6 +7,7 @@ abundance and an HTML report.
 | Folder | Dataset | Input | What it does |
 |---|---|---|---|
 | [`ptx_rats_emtab13426/`](ptx_rats_emtab13426) | [E-MTAB-13426](https://www.ebi.ac.uk/biostudies/arrayexpress/studies/E-MTAB-13426) | ENA FASTQ (PRJEB67467) | cutadapt → DADA2 → SILVA 138.2 → phyloseq → alpha/beta diversity, PERMANOVA, DESeq2 + ANCOM-BC2 |
+| [`ptx_patients_emtab13423/`](ptx_patients_emtab13423) | [E-MTAB-13423](https://www.ebi.ac.uk/biostudies/arrayexpress/studies/E-MTAB-13423) | ENA FASTQ (ERP152473) | Same pipeline: breast cancer patients with low or high paclitaxel-induced neuropathy vs healthy controls |
 
 ```
 ENA FASTQ (PRJEB67467) ──► cutadapt ──► DADA2 ──► SILVA 138.2 + tree ──► phyloseq ──► statistics ──► report
@@ -21,8 +22,9 @@ This repository was split out of [arlindomatias/projects](https://github.com/arl
 | Project | Report |
 |---|---|
 | `ptx_rats_emtab13426` | [Gut microbiota of paclitaxel-treated rats](https://arlindomatias.github.io/microbiome/ptx_rats_emtab13426/reports/report.html) |
+| `ptx_patients_emtab13423` | [Gut microbiota of breast cancer patients with paclitaxel-induced neuropathy](https://arlindomatias.github.io/microbiome/ptx_patients_emtab13423/reports/report.html) |
 
-The report is built by the `report` rule of the Snakefile (`reports/report.html`) and published with GitHub Pages.
+Each report is built by the `report` rule of the project's Snakefile (`reports/report.html`) and published with GitHub Pages.
 
 ## Project layout
 
@@ -48,6 +50,7 @@ scripts/
     ├── trim_primers.sh     # cutadapt, both mate orientations
     ├── quality_profiles.R, filter_trim.R, dada2_denoise.R, assign_taxonomy.R, build_phyloseq.R
     ├── analysis.R          # composition, alpha/beta diversity, PERMANOVA, DESeq2 + ANCOM-BC2
+    │                       # (groups, comparisons and pairing come from each project's config.yaml)
     └── report.py           # HTML report of an amplicon project
 ```
 
@@ -60,7 +63,7 @@ scripts/
 
 ```bash
 git clone git@github.com:arlindomatias/microbiome.git
-cd microbiome/ptx_rats_emtab13426
+cd microbiome/ptx_rats_emtab13426      # or ptx_patients_emtab13423
 export DATA=/path/to/large/storage
 snakemake -n --use-conda                                   # dry run
 snakemake --use-conda --cores 8 --resources downloads=4    # full run

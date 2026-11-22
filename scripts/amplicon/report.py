@@ -1,8 +1,9 @@
 """HTML report for a 16S amplicon project: reads → ASVs → composition → diversity → differential abundance.
 
 Run through Snakemake (`script:` directive, rule `report`). Project-specific text comes from
-`snakemake.params` and cutoffs from the config. It only reads results/, plots/ and reports/sessionInfo.txt;
-every number in the text is computed from those tables.
+`snakemake.params` (design, notes, pipeline, read_notes, error_notes, paper_taxa_text, label_notes) and the
+study design (groups, comparisons, subject column) and cutoffs from the config. It only reads results/, plots/
+and reports/sessionInfo.txt; every number in the text is computed from those tables.
 """
 import os
 import sys
@@ -17,9 +18,33 @@ inp, out, prm, cfg = snakemake.input, snakemake.output, snakemake.params, snakem
 P, R = "plots", "results"
 q_cut = cfg["da_qvalue"]
 
-GROUP_LABELS = {"Control": "Control", "PTX_WK2": "PTX week 2", "PTX_WK4": "PTX week 4"}
-COMPARISONS = ["Control vs PTX week 2", "Control vs PTX week 4", "PTX week 2 vs week 4 (paired)"]
-RUN_LABELS = {"AG": "AG (MiSeq 2×300)", "BD": "BD (MiSeq 2×250)"}
+GROUP_LABELS = dict(cfg["groups"])
+REF_GROUP = next(iter(GROUP_LABELS))
+COMPARISONS = [c["name"] for c in cfg["comparisons"]]
+PAIRED = [c["name"] for c in cfg["comparisons"] if c.get("paired")]
+UNPAIRED = [c for c in COMPARISONS if c not in PAIRED]
+SUBJECT = cfg["subject_column"]
+RUN_LABELS = dict(cfg.get("seq_run_labels", {}))
+
+
+def param(name, default=""):
+    """Optional project text from the rule's params."""
+    return getattr(prm, name, default) or default
+
+
+def names(items):
+    items = list(items)
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
+# How the two-group tests and models treat paired comparisons, for the text.
+if PAIRED and UNPAIRED:
+    WILCOXON_TEXT = (f"the rank-sum test for {names(UNPAIRED)}, and the signed-rank test, paired by {SUBJECT}, "
+                     f"for {names(PAIRED)}")
+elif PAIRED:
+    WILCOXON_TEXT = f"the signed-rank test, paired by {SUBJECT}"
+else:
+    WILCOXON_TEXT = "the rank-sum test; all comparisons are between independent samples"
 
 
 def read(name):
@@ -36,7 +61,9 @@ def fmt_p(p, prefix="p"):
     return f"{prefix} < 0.001" if p < 0.001 else f"{prefix} = {p:.2g}"
 
 
-samples = read("samples")
+samples_all = read("samples")
+EXCLUDED = dict(cfg.get("exclude_samples") or {})
+samples = samples_all[~samples_all["sample"].isin(EXCLUDED)].reset_index(drop=True)
 track = read("read_tracking")
 summ = read("run_summary").set_index("key")["value"]
 phylum_tests = read("phylum_tests")
@@ -49,8 +76,8 @@ da = read("differential_abundance_genus")
 paper = read("paper_taxa_tests")
 label_check = read("authors_label_check")
 
-n_ctrl = int((samples["group"] == "Control").sum())
-n_ptx_rats = samples.loc[samples["group"] != "Control", "rat"].nunique()
+n_ctrl = int((samples["group"] == REF_GROUP).sum())
+ref_label = GROUP_LABELS[REF_GROUP].lower()
 
 both = da[da["called_by"] == "both"]
 robust_genera = both["genus"].nunique()
@@ -69,17 +96,24 @@ r.kpis([
 # ---------------------------------------------------------------- design
 r.h2("Study design")
 r.md(prm.design)
+r.md(param("groups_text"))
+cmp_lines = "\n".join(
+    f"* **{c['name']}**: {GROUP_LABELS[c['groups'][1]]} vs {GROUP_LABELS[c['groups'][0]]}"
+    + (f", paired by {SUBJECT} (grey lines in the plots join the same {SUBJECT})" if c.get("paired") else "")
+    + "." for c in cfg["comparisons"])
 r.md(f"""
-* **Control**: {n_ctrl} vehicle-treated rats, one sample each.
-* **PTX week 2 / PTX week 4**: {n_ptx_rats} paclitaxel-treated rats, each sampled at both time points.
-  Week 2 vs week 4 is therefore a **paired** comparison (grey lines in the plots join the same rat).
+Comparisons (fold changes are the second group relative to the first):
+
+{cmp_lines}
 """)
-design = (samples.assign(group=samples["group"].map(GROUP_LABELS),
+design = (samples.assign(group=pd.Categorical(samples["group"].map(GROUP_LABELS),
+                                              categories=list(GROUP_LABELS.values())),
                          seq_run=samples["seq_run"].map(RUN_LABELS).fillna(samples["seq_run"]))
-          .groupby(["group", "seq_run"]).size().reset_index(name="samples")
+          .groupby(["group", "seq_run"], observed=True)
+          .agg(samples=("sample", "size"), **{f"{SUBJECT}s": (SUBJECT, "nunique")}).reset_index()
           .rename(columns={"seq_run": "sequencing run"}))
 r.table(design, "Samples per group and sequencing run.")
-r.md(prm.notes)
+r.md(param("notes"))
 
 r.h2("Pipeline")
 r.md(prm.pipeline)
@@ -95,35 +129,37 @@ ENA FASTQ ──► cutadapt (both mate orientations) ──► DADA2 filterAndT
 # ---------------------------------------------------------------- input and read processing
 r.h2("Input data")
 r.md(f"""
-The input is {len(samples)} paired-end FASTQ runs from ENA. Sample names, groups, rats and sequencing runs come
-from the ArrayExpress sample sheet (`data/E-MTAB-13426.sdrf.txt`); the full sheet is `results/samples.tsv`.
+The input is {len(samples_all)} paired-end samples from ENA ({len(samples)} analysed). Sample names, groups, {SUBJECT}s and sequencing runs come
+from the ArrayExpress sample sheet (`{cfg["sdrf"]}`); the full sheet is `results/samples.tsv`.
 """)
-r.table(samples[["sample", "run", "group", "rat", "week", "seq_run"]], "Samples.", collapsed=True)
+if EXCLUDED:
+    r.md("\n".join(f"> **{k} is excluded** from the analysis: {v}. It is kept in the read tracking table."
+                    for k, v in EXCLUDED.items()))
+r.table(samples_all, "Samples (including excluded ones).", collapsed=True)
 
 r.h2("Read processing")
+track_all = track
+track = track[~track["sample"].isin(EXCLUDED)]  # read-processing numbers of the analysed samples
 orient = track["orientation"].value_counts()
 primer_pct = 100 * track["primers_found"] / track["raw"]
 chim_pct = 100 * (1 - track["nonchim"].sum() / track["merged"].sum())
+n_swapped = int(orient.get("swapped", 0))
+orient_text = (f"in {n_swapped} of {len(track)} samples R1 starts with the reverse primer (806R)" if n_swapped
+               else f"R1 starts with the forward primer (338F) in all {len(track)} samples")
 r.md(f"""
-* **Mixed mate orientation:** in {int(orient.get("swapped", 0))} of {len(track)} runs R1 starts with the reverse
-  primer (806R). `trim_primers.sh` tries both orientations and re-orients the reads, so "fwd" reads always start
-  after 338F. Both primers were found in {primer_pct.min():.1f}–{primer_pct.max():.1f}% of pairs per sample.
-* **Two read lengths:** the 2×250 run gives ~225/231 bp reads after primer removal. Truncation is set to
-  {cfg["trunc_len_fwd"]}/{cfg["trunc_len_rev"]} bp for all samples, which leaves ~20 bp of overlap on the
-  ~429 bp amplicon.
+* **Mate orientation:** {orient_text}. `trim_primers.sh` tries both orientations and re-orients the reads, so
+  "fwd" reads always start after 338F. Both primers were found in {primer_pct.min():.1f}–{primer_pct.max():.1f}% of pairs per sample.
+{param("read_notes").strip()}
 * **Chimeras:** {chim_pct:.0f}% of merged reads were removed as chimeras. Between
   {int(track["nonchim"].min()):,} and {int(track["nonchim"].max()):,} non-chimeric pairs per sample remain
   ({track["retained_pct"].min():.0f}–{track["retained_pct"].max():.0f}% of the raw pairs).
 """)
 r.figure(f"{P}/read_tracking.png", "Read pairs per sample after each step.", width="85%")
-r.table(track, "Read tracking (`results/read_tracking.tsv`).", collapsed=True)
+r.table(track_all, "Read tracking (`results/read_tracking.tsv`).", collapsed=True)
 
 r.h3("Quality profiles and error models")
-r.md("""
-Aggregate quality profiles of the primer-trimmed reads were used to choose the truncation lengths. DADA2 error
-rates stay around 10⁻³–10⁻² even at Q38–40. Substitution rates that do not depend on quality point to PCR errors
-from the second (TruSeq Nano) library PCR rather than to sequencing errors, which fits the high chimera rate.
-""")
+r.md(param("error_notes",
+           "Aggregate quality profiles of the primer-trimmed reads were used to choose the truncation lengths."))
 r.figure(f"{P}/quality_profiles.png", "Aggregate DADA2 quality profiles of the primer-trimmed reads.", code=None)
 r.figure(f"{P}/error_models.png", "DADA2 error models per sequencing run × orientation batch (points: observed; "
          "black line: fitted; red line: expected from the nominal quality).", code=None)
@@ -155,9 +191,9 @@ r.h3("Per sample")
 r.figure(f"{P}/composition_per_sample.png", "Relative abundance per sample.")
 
 r.h3("Main phyla and the Bacillota/Bacteroidota ratio")
-r.md("""
+r.md(f"""
 Each panel shows one phylum (or the log2 Bacillota/Bacteroidota ratio). Brackets show BH-adjusted Wilcoxon
-p-values. Control vs PTX uses the rank-sum test; week 2 vs week 4 uses the signed-rank test, paired by rat.
+p-values: {WILCOXON_TEXT}.
 """)
 r.figure(f"{P}/phyla_boxplots.png", "Main phyla (relative abundance, %) and the log2 Bacillota/Bacteroidota ratio.")
 r.table(phylum_tests.pivot(index="variable", columns="comparison", values="p_adj")[COMPARISONS].reset_index(),
@@ -167,7 +203,7 @@ r.table(phylum_tests.pivot(index="variable", columns="comparison", values="p_adj
 r.h2("Alpha diversity")
 r.md(f"""
 Samples are rarefied to {int(summ["rarefaction_depth"]):,} reads. Brackets show BH-adjusted Wilcoxon p-values
-(rank-sum vs control; signed-rank, paired by rat, for week 2 vs week 4).
+({WILCOXON_TEXT}).
 """)
 r.figure(f"{P}/alpha_diversity.png", "Observed ASVs, Chao1, Shannon and inverse Simpson indices.")
 r.table(alpha_tests.pivot(index="index", columns="comparison", values="p_adj")[COMPARISONS].reset_index(),
@@ -183,13 +219,14 @@ Four distances:
 * **Unweighted UniFrac**: rarefied.
 * **Weighted UniFrac**: relative abundances.
 
-PERMANOVA (`adonis2`, {cfg["permutations"]:,} permutations) is run for each comparison separately. Permutations for
-week 2 vs week 4 are restricted within rats. `betadisper` tests whether groups differ in spread.
+PERMANOVA (`adonis2`, {cfg["permutations"]:,} permutations) is run for each comparison separately.{
+f" Permutations for {names(PAIRED)} are restricted within {SUBJECT}s." if PAIRED else ""} `betadisper` tests
+whether groups differ in spread.
 """)
 r.h3("Ordination (PCoA)")
-r.md("""
-Each point is a sample. Grey segments join the same PTX rat at week 2 and week 4, large outlined points are group
-centroids, and dashed ellipses are 68% normal-theory regions.
+r.md(f"""
+Each point is a sample.{f" Grey segments join samples of the same {SUBJECT}." if PAIRED else ""} Large outlined
+points are group centroids, and dashed ellipses are 68% normal-theory regions.
 """)
 r.figure(f"{P}/pcoa.png", "PCoA for each distance, with PERMANOVA R² and BH-adjusted p-values.")
 
@@ -200,27 +237,34 @@ where `betadisper` finds unequal spread (p < 0.05). In those cases part of the e
 than a shift in location.
 """)
 r.figure(f"{P}/permanova_r2.png", "PERMANOVA R² and BH-adjusted p-values.", width="85%")
-r.table(permanova, "PERMANOVA and betadisper (`results/permanova.tsv`; `p_adj`: BH over all 12 tests).")
+r.table(permanova, f"PERMANOVA and betadisper (`results/permanova.tsv`; `p_adj`: BH over all {len(permanova)} "
+        "tests).")
 
 r.h3("Distance from the control community")
 d2c_mean = d2c.groupby("group")["bray_curtis_to_controls"].mean().rename(index=GROUP_LABELS)
 r.md(f"""
-For every sample, this is the mean Bray-Curtis dissimilarity to the {n_ctrl} control samples (excluding itself).
+For every sample, this is the mean Bray-Curtis dissimilarity to the {n_ctrl} {ref_label} samples (excluding itself).
 Values near 1 mean almost nothing is shared. Group means: {"; ".join(f"{g} {v:.2f}" for g, v in d2c_mean.items())}.
 """)
-r.figure(f"{P}/distance_to_control.png", "Mean Bray-Curtis dissimilarity to the control samples.", width="60%")
+r.figure(f"{P}/distance_to_control.png", f"Mean Bray-Curtis dissimilarity to the {ref_label} samples.",
+         width="60%")
 
 # ---------------------------------------------------------------- differential abundance
+def model_text(unpaired, paired):
+    if PAIRED and UNPAIRED:
+        return f"`{unpaired}` for {names(UNPAIRED)}, `{paired}` for {names(PAIRED)}"
+    return f"`{paired if PAIRED else unpaired}`"
+
+
+
 r.h2("Differential abundance (genus level)")
 r.md(f"""
 ASVs are agglomerated to genus. Unassigned genera are labelled "&lt;lowest assigned rank&gt; (unclassified)". Each
 comparison is fitted on its own subset, keeping genera present in at least {cfg["min_prevalence"]:.0%} of that
 subset. Two methods are used:
 
-* **DESeq2** (negative binomial, `poscounts`): `~ group` for Control vs PTX, `~ rat + group` for the paired
-  week 2 vs week 4 comparison.
-* **ANCOM-BC2** (bias-corrected log-linear model): `group` for Control vs PTX, `rat + group` for the paired
-  comparison.
+* **DESeq2** (negative binomial, `poscounts`): {model_text("~ group", f"~ {SUBJECT} + group")}.
+* **ANCOM-BC2** (bias-corrected log-linear model): {model_text("group", f"{SUBJECT} + group")}.
 
 Genera with BH `q < {q_cut}` in **both** methods are treated as robust. Positive log2FC = higher in the second
 group of the comparison.
@@ -270,11 +314,12 @@ r.figure(f"{P}/heatmap_top_genera.png", "Top 30 genera, z-score of log10 relativ
 
 # ---------------------------------------------------------------- paper taxa
 r.h2("Taxa highlighted by the original study")
+r.md(param("paper_taxa_text"))
 r.md("""
-Zhong et al. report higher *Clostridium* and *Ruminococcus* on day 14. All SILVA genera whose names contain either
-term (and that are present in at least 25% of samples) are shown, with BH-adjusted Wilcoxon p-values as above.
+All SILVA genera whose names contain one of these terms (and that are present in at least 25% of samples) are
+shown, with BH-adjusted Wilcoxon p-values as above.
 """)
-r.figure(f"{P}/paper_taxa.png", "*Clostridium* and *Ruminococcus* genera (relative abundance, %).")
+r.figure(f"{P}/paper_taxa.png", "Genera highlighted by the original study (relative abundance, %).")
 if len(paper):
     r.table(paper.pivot(index="genus", columns="comparison", values="p_adj")[COMPARISONS].reset_index(),
             "BH-adjusted Wilcoxon p-values (`results/paper_taxa_tests.tsv`).")
@@ -282,26 +327,29 @@ if len(paper):
 # ---------------------------------------------------------------- authors' table
 r.h2("Consistency with the authors' processed table")
 r.md(f"""
-The authors' genus table (Greengenes, relative abundance; `data/otu_table_genus.txt`) is compared with this
-analysis for genera with the same name in both taxonomies. Unclassified groups are excluded, and SILVA suffixes are
-stripped before matching. **{int(float(summ["authors_genera_matched"]))} genera** match, and their mean abundances correlate
+The authors' genus table (Greengenes, relative abundance; `{cfg["authors_genus_table"]}`) is compared with
+this analysis for genera with the same name in both taxonomies. Unclassified groups and bracketed Greengenes names
+(e.g. *[Ruminococcus]*, a Lachnospiraceae genus unrelated to SILVA *Ruminococcus*) are excluded, and SILVA suffixes
+are stripped before matching. **{int(float(summ["authors_genera_matched"]))} genera** match, and their mean abundances correlate
 with Spearman rho = **{float(summ["authors_rho_means"]):.2f}**.
 """)
 r.figure(f"{P}/authors_comparison.png", "Mean relative abundance per genus: authors' table vs this analysis.",
          width="70%")
 
 r.h3("Sample label check")
-ptx = label_check[~label_check["sample"].str.startswith("C")].copy()
-other_tp = ptx.apply(lambda x: x["best_authors_sample"] != x["sample"]
-                     and x["best_authors_sample"].split("_")[0] == x["sample"].split("_")[0], axis=1)
-same = (label_check["best_authors_sample"] == label_check["sample"])
-ctrl_same = int(same[label_check["sample"].str.startswith("C")].sum())
+same = label_check["best_authors_sample"] == label_check["sample"]
+lc = label_check.merge(samples[["sample", "group", SUBJECT]], on="sample", how="left")
+subject_of = dict(zip(samples["sample"], samples[SUBJECT]))
+other_tp = (~same) & (lc["best_authors_sample"].map(subject_of) == lc[SUBJECT])
+per_group = "; ".join(f"{GROUP_LABELS[g]} {int(same[lc['group'] == g].sum())} of {int((lc['group'] == g).sum())}"
+                      for g in GROUP_LABELS)
+other_txt = (f" In **{int(other_tp.sum())}** samples the best match is the **same {SUBJECT} under another label**."
+             if other_tp.any() else "")
 r.md(f"""
 Each sample here is correlated (Spearman, shared genera) with every sample of the authors' table.
 
-> In **{int(other_tp.sum())} of {len(ptx)} PTX samples**, the best match is the **same rat at the other time
-> point** in the authors' table ({ctrl_same} of {n_ctrl} controls match their own label). The available data cannot
-> tell which labelling is correct. This report keeps the SDRF labels.
+> **{int(same.sum())} of {len(label_check)} samples** best match the authors' sample with the same label
+> ({per_group}).{other_txt} {param("label_notes").strip()}
 """)
 r.figure(f"{P}/label_check.png", "Spearman correlation between every sample of this analysis (rows) and of the "
          "authors' table (columns).")
@@ -324,7 +372,7 @@ r.appendix(
         ("results/distance_to_control*.tsv", "Bray-Curtis distance to controls and tests"),
         ("results/deseq2_genus.tsv, results/ancombc2_genus.tsv", "Differential abundance per method"),
         ("results/differential_abundance_genus.tsv", "Both methods merged, with the call per genus"),
-        ("results/paper_taxa_tests.tsv", "Tests for the *Clostridium* / *Ruminococcus* genera"),
+        ("results/paper_taxa_tests.tsv", "Tests for the genera highlighted by the original study"),
         ("results/authors_comparison.tsv, results/authors_label_check.tsv", "Comparison with the authors' table"),
         ("results/run_summary.tsv", "Key numbers of the run (read by this report)"),
     ],

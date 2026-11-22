@@ -38,6 +38,30 @@ trunc_len_rev: 229
 max_ee_fwd: 2
 max_ee_rev: 2
 
+# DADA2 error model: "loess" is the DADA2 default ("loess_monotonic" is for binned quality scores).
+error_function: "loess"
+
+# Sequencing runs (prefix of the submitted file names) as shown in the report.
+seq_run_labels:
+  AG: "AG (MiSeq 2×300)"
+  BD: "BD (MiSeq 2×250)"
+
+# Study design. Group keys and labels, in plotting order (the first group is the reference for
+# "distance to control"). Comparisons: fold changes are second vs first group; paired comparisons
+# match samples on the subject column (each PTX rat was sampled at week 2 and week 4).
+subject_column: "rat"
+groups:
+  Control: "Control"
+  PTX_WK2: "PTX week 2"
+  PTX_WK4: "PTX week 4"
+comparisons:
+  - {name: "Control vs PTX week 2", groups: [Control, PTX_WK2], paired: false}
+  - {name: "Control vs PTX week 4", groups: [Control, PTX_WK4], paired: false}
+  - {name: "PTX week 2 vs week 4 (paired)", groups: [PTX_WK2, PTX_WK4], paired: true}
+
+# Genera highlighted by Zhong et al. (2023) for the rats (regex on SILVA genus names).
+paper_taxa: "Clostridium|Ruminococcus"
+
 # Statistics.
 min_prevalence: 0.25   # genus kept for differential abundance if present in >= 25% of the compared samples
 da_qvalue: 0.05        # BH q-value cutoff, DESeq2 and ANCOM-BC2

@@ -1,0 +1,15 @@
+key	value
+asvs_total	15754
+asvs_nonbacterial	2
+asvs_organelle	41
+asvs_kept	15711
+reads_min	14776
+reads_max	99405
+reads_median	39603
+rarefaction_depth	14776
+genus_assigned_pct	59.6
+genus_assigned_reads_pct	97.7
+genera	857
+ancombc2_failed	
+authors_genera_matched	18
+authors_rho_means	0.79

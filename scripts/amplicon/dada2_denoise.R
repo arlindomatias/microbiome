@@ -15,7 +15,7 @@ samples <- unlist(snakemake@params[["samples"]])
 filt_f <- setNames(unlist(snakemake@input[["fwd"]]), samples)
 filt_r <- setNames(unlist(snakemake@input[["rev"]]), samples)
 
-# Error profiles differ between sequencing runs (2x300 vs 2x250) and between submitted R1 and
+# Error profiles differ between sequencing runs (e.g. 2x300 vs 2x250) and between submitted R1 and
 # R2. Mate orientation differs between samples, so the "fwd" file comes from R1 in some and
 # from R2 in others. Error models are therefore learned, and samples denoised, separately per
 # batch = sequencing run x orientation. Merged ASVs span the same amplicon in every batch.
@@ -25,14 +25,35 @@ seq_run <- setNames(unlist(snakemake@params[["seq_runs"]]), samples)
 batch <- paste0("run ", seq_run, ", ", orientation)
 cat("Samples per batch:\n"); print(table(batch))
 
+# Error function. "loess" is the DADA2 default. "loess_monotonic" is for binned quality scores
+# (NovaSeq and recent MiSeq software report only a few Q values): the default loess fit is then
+# poorly constrained and can rise again at high Q, so the fitted rates are forced to be
+# non-increasing with quality (as discussed in DADA2 issue #1307).
+error_function <- snakemake@params[["error_function"]]
+if (is.null(error_function)) error_function <- "loess"
+loess_monotonic <- function(trans) {
+  err <- loessErrfun(trans)
+  for (nt in c("A", "C", "G", "T")) {
+    subs <- paste0(nt, "2", setdiff(c("A", "C", "G", "T"), nt))
+    for (r in subs) err[r, ] <- cummin(err[r, ])
+    err[paste0(nt, "2", nt), ] <- 1 - colSums(err[subs, , drop = FALSE])
+  }
+  err
+}
+errfun <- switch(error_function, loess = loessErrfun, loess_monotonic = loess_monotonic,
+                 stop("Unknown error_function: ", error_function))
+cat("Error function:", error_function, "\n")
+
 # dada() returns a bare object instead of a list when given a single sample.
 as_list <- function(x, s) if (inherits(x, "dada")) setNames(list(x), s) else x
 dada_f <- dada_r <- list()
 err_plots <- list()
 for (b in sort(unique(batch))) {
   s <- samples[batch == b]
-  err_f <- learnErrors(filt_f[s], multithread = threads, randomize = TRUE)
-  err_r <- learnErrors(filt_r[s], multithread = threads, randomize = TRUE)
+  err_f <- learnErrors(filt_f[s], errorEstimationFunction = errfun, multithread = threads,
+                       randomize = TRUE)
+  err_r <- learnErrors(filt_r[s], errorEstimationFunction = errfun, multithread = threads,
+                       randomize = TRUE)
   err_plots[[paste(b, "fwd")]] <- plotErrors(err_f, nominalQ = TRUE) +
     ggtitle(sprintf("Forward reads, %s batch (n = %d)", b, length(s)))
   err_plots[[paste(b, "rev")]] <- plotErrors(err_r, nominalQ = TRUE) +

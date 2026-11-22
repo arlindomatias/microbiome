@@ -1,0 +1,411 @@
+# 16S rRNA V3-V4 amplicon pipeline for ArrayExpress E-MTAB-13423 (ENA ERP152473):
+# feces of breast cancer patients after paclitaxel, with low (grade 1) or high (grade >= 2)
+# paclitaxel-induced peripheral neuropathy (PIPN), and of healthy controls.
+# ENA FASTQ -> cutadapt (primers) -> DADA2 (ASVs) -> SILVA 138.2 taxonomy -> MAFFT/FastTree
+# -> phyloseq -> statistics and figures (composition, alpha/beta diversity, differential abundance)
+# -> self-contained HTML report (reports/report.html).
+# Run from this folder: snakemake --use-conda --cores 8 --resources downloads=4
+# Scripts live in the repository-level scripts/ folder (scripts/amplicon/, scripts/html_report.py).
+
+import csv
+import os
+import re
+
+configfile: "config.yaml"
+
+if "DATA" not in os.environ:
+    raise ValueError("Environment variable DATA is not set (FASTQ, SILVA and work files live under $DATA).")
+
+
+def cfg_path(key):
+    return os.path.expandvars(config[key])
+
+
+SDRF = config["sdrf"]
+FASTQ_DIR = cfg_path("fastq_dir")
+WORK = cfg_path("work_dir")  # primer-trimmed and filtered FASTQ (large, outside the repository)
+S = "../scripts/amplicon"
+SILVA_DIR = cfg_path("silva_dir")
+SILVA_TRAINSET = os.path.join(SILVA_DIR, "silva_nr99_v138.2_toGenus_trainset.fa.gz")
+SILVA_SPECIES = os.path.join(SILVA_DIR, "silva_v138.2_assignSpecies.fa.gz")
+
+# Sample-name prefix -> group key (config "groups") and the SDRF disease term it must match.
+GROUP_OF_PREFIX = {
+    "C": ("Control", "normal"),
+    "L": ("Low_PIPN", "low paclitaxel-induced peripheral neuropathy"),
+    "H": ("High_PIPN", "high paclitaxel-induced peripheral neuropathy"),
+}
+
+
+def read_samples(sdrf):
+    """One entry per sample (C1-C20, L1-L30, H1-H30, as in the submitted file names and the authors'
+    table). R1 and R2 of a sample were deposited as two separate single-end ENA runs."""
+    samples = {}
+    with open(sdrf, newline="") as fh:
+        rows = csv.reader(fh, delimiter="\t")
+        header = next(rows)
+        col = {name: header.index(name) for name in
+               ("Source Name", "Comment[SUBMITTED_FILE_NAME]", "Comment[ENA_RUN]",
+                "Comment[ENA_SAMPLE]", "Factor Value[disease]")}
+        for row in rows:
+            fname = row[col["Comment[SUBMITTED_FILE_NAME]"]]
+            m = re.fullmatch(r"ZTPSN\d+([A-Z]+)\d+-([CLH])(\d+)_R([12])\.fq\.gz", fname)
+            if not m:
+                raise ValueError(f"Unexpected file name in SDRF: {fname}")
+            seq_run, prefix, number, mate = m.groups()
+            sample = f"{prefix}{number}"
+            group, disease = GROUP_OF_PREFIX[prefix]
+            if row[col["Factor Value[disease]"]] != disease:
+                raise ValueError(f"{fname}: disease '{row[col['Factor Value[disease]']]}' does not match {group}")
+            d = samples.setdefault(sample, dict(
+                ena_sample=row[col["Comment[ENA_SAMPLE]"]],
+                source_name=row[col["Source Name"]],
+                patient=sample, group=group, seq_run=seq_run,
+            ))
+            if d["ena_sample"] != row[col["Comment[ENA_SAMPLE]"]]:
+                raise ValueError(f"{sample}: R1 and R2 belong to different ENA samples")
+            d[f"run_r{mate}"] = row[col["Comment[ENA_RUN]"]]
+    for s, d in samples.items():
+        if "run_r1" not in d or "run_r2" not in d:
+            raise ValueError(f"{s}: R1 or R2 missing from the SDRF")
+    return samples
+
+
+SAMPLES = read_samples(SDRF)
+RUNS = [d[k] for d in SAMPLES.values() for k in ("run_r1", "run_r2")]
+
+wildcard_constraints:
+    sample="|".join(SAMPLES),
+    run="|".join(RUNS),
+
+
+rule all:
+    input:
+        "reports/report.html",
+
+
+# ---------------------------------------------------------------- downloads
+
+rule download_fastq:
+    """The submitted FASTQ of one ENA run (each run holds one mate of a sample), checked against the
+    ENA md5 sum. The submitted files are used rather than ENA's generated FASTQ: they keep the
+    original Illumina read names, identical in R1 and R2 (ENA prefixes them with the run accession,
+    which differs between the two runs of a sample), and some generated FASTQ are missing on the
+    ENA servers. The reads are the same in both."""
+    output:
+        fq=os.path.join(FASTQ_DIR, "{run}.fastq.gz"),
+    threads: 1
+    resources: downloads=1
+    log: "logs/download_fastq/{run}.log"
+    retries: 2
+    shell:
+        r"""
+        exec 2> {log:q}
+        report=$(curl -sf --retry 3 "https://www.ebi.ac.uk/ena/portal/api/filereport?accession={wildcards.run}&result=read_run&fields=submitted_ftp,submitted_md5&format=tsv" | tail -n 1)
+        url=$(echo "$report" | cut -f2)
+        md5=$(echo "$report" | cut -f3)
+        curl -sf --retry 3 --speed-limit 1024 --speed-time 60 -o {output.fq:q} "https://$url"
+        echo "$md5  {output.fq}" | md5sum -c - >&2
+        """
+
+
+rule download_silva:
+    """SILVA 138.2 reference files formatted for DADA2 (Zenodo), md5-checked."""
+    output:
+        trainset=SILVA_TRAINSET,
+        species=SILVA_SPECIES,
+    params:
+        trainset_url=config["silva_trainset_url"],
+        trainset_md5=config["silva_trainset_md5"],
+        species_url=config["silva_species_url"],
+        species_md5=config["silva_species_md5"],
+    threads: 1
+    log: "logs/download_silva/silva.log"
+    shell:
+        r"""
+        exec 2> {log:q}
+        curl -sfL --retry 3 -o {output.trainset:q} {params.trainset_url:q}
+        echo "{params.trainset_md5}  {output.trainset}" | md5sum -c - >&2
+        curl -sfL --retry 3 -o {output.species:q} {params.species_url:q}
+        echo "{params.species_md5}  {output.species}" | md5sum -c - >&2
+        """
+
+
+# ---------------------------------------------------------------- metadata
+
+rule sample_metadata:
+    """Sample sheet derived from the SDRF (group, patient, accessions)."""
+    input: SDRF
+    output: "results/samples.tsv"
+    threads: 1
+    log: "logs/sample_metadata/samples.log"
+    run:
+        fields = ["sample", "run_r1", "run_r2", "ena_sample", "source_name", "patient", "group", "seq_run"]
+        with open(output[0], "w", newline="") as fh:
+            w = csv.writer(fh, delimiter="\t", lineterminator="\n")
+            w.writerow(fields)
+            for s, d in SAMPLES.items():
+                w.writerow([s] + [d[f] for f in fields[1:]])
+        with open(log[0], "w") as fh:
+            fh.write(f"{len(SAMPLES)} samples written\n")
+
+
+# ---------------------------------------------------------------- primers and QC
+
+rule cutadapt:
+    """Remove primers and keep only pairs with both primers found (cutadapt also checks that the
+    two ENA runs of a sample hold the same reads in the same order). Both mate orientations are
+    tried and outputs are re-oriented: *_fwd always follows 338F."""
+    input:
+        r1=lambda wc: os.path.join(FASTQ_DIR, f"{SAMPLES[wc.sample]['run_r1']}.fastq.gz"),
+        r2=lambda wc: os.path.join(FASTQ_DIR, f"{SAMPLES[wc.sample]['run_r2']}.fastq.gz"),
+        script=f"{S}/trim_primers.sh",
+    output:
+        fwd=f"{WORK}/trimmed/{{sample}}_fwd.fastq.gz",
+        rev=f"{WORK}/trimmed/{{sample}}_rev.fastq.gz",
+        json=f"{WORK}/trimmed/{{sample}}.cutadapt.json",
+    params:
+        fwd=config["primer_fwd"],
+        rev=config["primer_rev"],
+    threads: 2
+    conda: "envs/cutadapt.yaml"
+    log: "logs/cutadapt/{sample}.log"
+    shell:
+        "bash {input.script} {input.r1:q} {input.r2:q} {params.fwd} {params.rev} "
+        "{output.fwd:q} {output.rev:q} {output.json:q} {threads} > {log:q} 2>&1"
+
+
+rule quality_profiles:
+    """Aggregate DADA2 quality profiles of primer-trimmed reads (used to choose truncLen)."""
+    input:
+        fwd=expand(f"{WORK}/trimmed/{{sample}}_fwd.fastq.gz", sample=SAMPLES),
+        rev=expand(f"{WORK}/trimmed/{{sample}}_rev.fastq.gz", sample=SAMPLES),
+    output: "plots/quality_profiles.png"
+    threads: 1
+    conda: "envs/dada2.yaml"
+    log: "logs/quality_profiles/quality_profiles.log"
+    script: f"{S}/quality_profiles.R"
+
+
+# ---------------------------------------------------------------- DADA2
+
+rule filter_trim:
+    input:
+        fwd=f"{WORK}/trimmed/{{sample}}_fwd.fastq.gz",
+        rev=f"{WORK}/trimmed/{{sample}}_rev.fastq.gz",
+    output:
+        fwd=f"{WORK}/filtered/{{sample}}_fwd.fastq.gz",
+        rev=f"{WORK}/filtered/{{sample}}_rev.fastq.gz",
+        stats=f"{WORK}/filtered/{{sample}}.filter.tsv",
+    params:
+        trunc_len=[config["trunc_len_fwd"], config["trunc_len_rev"]],
+        max_ee=[config["max_ee_fwd"], config["max_ee_rev"]],
+    threads: 1
+    conda: "envs/dada2.yaml"
+    log: "logs/filter_trim/{sample}.log"
+    script: f"{S}/filter_trim.R"
+
+
+rule dada2_denoise:
+    """Error models (per sequencing run x mate orientation batch), sample inference,
+    pair merging, chimera removal, read tracking."""
+    input:
+        fwd=expand(f"{WORK}/filtered/{{sample}}_fwd.fastq.gz", sample=SAMPLES),
+        rev=expand(f"{WORK}/filtered/{{sample}}_rev.fastq.gz", sample=SAMPLES),
+        stats=expand(f"{WORK}/filtered/{{sample}}.filter.tsv", sample=SAMPLES),
+        cutadapt=expand(f"{WORK}/trimmed/{{sample}}.cutadapt.json", sample=SAMPLES),
+    output:
+        seqtab="data/seqtab_nochim.rds",
+        fasta="data/asvs.fasta",
+        track="results/read_tracking.tsv",
+        errors="plots/error_models.png",
+    params:
+        samples=list(SAMPLES),
+        seq_runs=[d["seq_run"] for d in SAMPLES.values()],
+        error_function=config["error_function"],
+        seed=config["seed"],
+    threads: 8
+    conda: "envs/dada2.yaml"
+    log: "logs/dada2_denoise/dada2.log"
+    script: f"{S}/dada2_denoise.R"
+
+
+rule assign_taxonomy:
+    input:
+        seqtab="data/seqtab_nochim.rds",
+        trainset=SILVA_TRAINSET,
+        species=SILVA_SPECIES,
+    output:
+        taxa="results/taxonomy.tsv",
+    params:
+        seed=config["seed"],
+        chunk_size=config.get("taxonomy_chunk_size", 0),
+        checkpoint_dir=f"{WORK}/taxonomy_chunks",
+    threads: config.get("taxonomy_threads", 8)
+    conda: "envs/dada2.yaml"
+    log: "logs/assign_taxonomy/taxonomy.log"
+    script: f"{S}/assign_taxonomy.R"
+
+
+rule align_asvs:
+    input: "data/asvs.fasta"
+    output: "data/asvs_aligned.fasta"
+    threads: 8
+    conda: "envs/tree.yaml"
+    log: "logs/align_asvs/mafft.log"
+    shell: "mafft --auto --thread {threads} {input} > {output} 2> {log}"
+
+
+rule build_tree:
+    input: "data/asvs_aligned.fasta"
+    output: "data/asvs.nwk"
+    threads: 1
+    conda: "envs/tree.yaml"
+    log: "logs/build_tree/fasttree.log"
+    shell: "FastTree -nt -gtr -quiet {input} > {output} 2> {log}"
+
+
+rule build_phyloseq:
+    input:
+        seqtab="data/seqtab_nochim.rds",
+        taxa="results/taxonomy.tsv",
+        tree="data/asvs.nwk",
+        metadata="results/samples.tsv",
+    output:
+        ps="data/ps.rds",
+        counts="results/asv_counts.tsv",
+    params:
+        groups=config["groups"],
+        exclude=list(config.get("exclude_samples", {})),
+    threads: 1
+    conda: "envs/dada2.yaml"
+    log: "logs/build_phyloseq/phyloseq.log"
+    script: f"{S}/build_phyloseq.R"
+
+
+# ---------------------------------------------------------------- statistics and report
+
+# Tables and figures always written by the analysis script. robust_genera.png and
+# da_fold_changes.png are only made when some genus is significant, so they are not declared.
+TABLES = ["composition_group_means", "phylum_tests", "alpha_diversity", "alpha_diversity_tests",
+          "permanova", "distance_to_control", "distance_to_control_tests", "genus_relative_abundance",
+          "deseq2_genus", "ancombc2_genus", "differential_abundance_genus", "paper_taxa_tests",
+          "authors_comparison", "authors_label_check", "run_summary"]
+FIGURES = ["read_tracking", "rarefaction", "composition_group_means", "composition_per_sample",
+           "phyla_boxplots", "alpha_diversity", "pcoa", "permanova_r2", "distance_to_control",
+           "volcano", "heatmap_top_genera", "paper_taxa", "authors_comparison", "label_check"]
+
+
+rule analysis:
+    """Composition, alpha/beta diversity, PERMANOVA, DESeq2 + ANCOM-BC2, comparison with the
+    authors' table. Writes results/*.tsv, plots/*.png and reports/sessionInfo.txt."""
+    input:
+        ps="data/ps.rds",
+        track="results/read_tracking.tsv",
+        authors_genus=config["authors_genus_table"],
+        script=f"{S}/analysis.R",
+    output:
+        expand("results/{t}.tsv", t=TABLES),
+        expand("plots/{f}.png", f=FIGURES),
+        session="reports/sessionInfo.txt",
+    params:
+        seed=config["seed"],
+        results_dir="results",
+        plots_dir="plots",
+        min_prevalence=config["min_prevalence"],
+        da_qvalue=config["da_qvalue"],
+        permutations=config["permutations"],
+        groups=config["groups"],
+        comparisons=config["comparisons"],
+        subject=config["subject_column"],
+        paper_taxa=config["paper_taxa"],
+    threads: 4
+    conda: "envs/analysis.yaml"
+    log: "logs/analysis/analysis.log"
+    script: f"{S}/analysis.R"
+
+
+rule report:
+    """Self-contained HTML report (Python, shared scripts/html_report.py) from results/ and plots/."""
+    input:
+        tables=expand("results/{t}.tsv", t=TABLES),
+        track="results/read_tracking.tsv",
+        samples="results/samples.tsv",
+        plots=expand("plots/{f}.png", f=FIGURES + ["quality_profiles", "error_models"]),
+        session="reports/sessionInfo.txt",
+        config=["config.yaml"],
+        envs=["envs/cutadapt.yaml", "envs/dada2.yaml", "envs/tree.yaml", "envs/analysis.yaml",
+              "envs/report.yaml"],
+        scripts=[f"{S}/report.py", "../scripts/html_report.py"],
+        code=[f"{S}/analysis.R"],
+    output:
+        html="reports/report.html",
+    params:
+        title="Gut microbiota of breast cancer patients with paclitaxel-induced neuropathy",
+        subtitle="16S rRNA V3-V4 re-analysis of E-MTAB-13423 (Zhong et al. 2023)",
+        design="""
+Feces of 60 breast cancer patients who completed paclitaxel treatment and of 20 healthy controls were sequenced
+(16S rRNA V3-V4) by Zhong et al. (2023), *Blockade of CCR5 suppresses paclitaxel-induced peripheral neuropathic
+pain caused by increased deoxycholic acid*, [*Cell Reports* 42:113386](https://doi.org/10.1016/j.celrep.2023.113386).
+Neuropathy was graded with NCI-CTCAE v4.0 and EORTC QLQ-CIPN20: grade ≥ 2 is **high PIPN**, grade 1 is **low
+PIPN**. Data: ArrayExpress [E-MTAB-13423](https://www.ebi.ac.uk/biostudies/arrayexpress/studies/E-MTAB-13423),
+ENA [ERP152473](https://www.ebi.ac.uk/ena/browser/view/ERP152473). The rat experiment of the same paper is
+re-analysed with the same pipeline in [`ptx_rats_emtab13426`](../../ptx_rats_emtab13426/reports/report.html).
+
+The authors deposited only a relative-abundance table of the 20 most abundant genera. This analysis starts from
+the raw reads and produces ASV **counts**, which allow count-based methods (Chao1, DESeq2, ANCOM-BC2,
+rarefaction).
+""",
+        groups_text="""
+* **Healthy control**: healthy volunteers, one sample each.
+* **Low PIPN / High PIPN**: breast cancer patients after paclitaxel, one sample each, taken after treatment.
+""",
+        notes="""
+> **Read with two caveats.**
+>
+> 1. **Patients vs healthy controls is not a paclitaxel effect alone.** The controls do not have cancer and did
+>    not receive chemotherapy (breast cancer regimens usually combine paclitaxel with other drugs). Low vs high
+>    PIPN, both groups of treated patients, is the comparison closest to the question of the paper.
+> 2. **Cross-sectional design, one sample per person.** There is no sample before treatment, and diet, age,
+>    BMI and other drugs are not available in ArrayExpress, so they cannot be adjusted for.
+""",
+        pipeline="""
+1. **download_fastq / download_silva**: submitted FASTQ from ENA (R1 and R2 are separate ENA runs) and
+   SILVA 138.2 (DADA2 format, Zenodo), md5-checked.
+2. **sample_metadata**: sample sheet (group, patient, ENA runs of R1 and R2) parsed from the ArrayExpress SDRF.
+3. **cutadapt** (`scripts/amplicon/trim_primers.sh`): removes the 338F/806R primers, trying both mate
+   orientations and re-orienting the reads.
+4. **quality_profiles / filter_trim**: DADA2 quality profiles, then `filterAndTrim`.
+5. **dada2_denoise**: error models per sequencing run × orientation batch (monotonic loess fit for binned
+   quality scores), sample inference, pair merging, chimera removal.
+6. **assign_taxonomy**: naive Bayesian classifier against SILVA 138.2, then exact-match species.
+7. **align_asvs / build_tree**: MAFFT + FastTree, midpoint-rooted tree for UniFrac.
+8. **build_phyloseq**: phyloseq object (counts, taxonomy, tree, metadata).
+9. **analysis** (`scripts/amplicon/analysis.R`): composition, alpha/beta diversity, PERMANOVA,
+   DESeq2 + ANCOM-BC2, comparison with the authors' table.
+10. **report** (`scripts/amplicon/report.py`): this page.
+""",
+        read_notes="""
+* **Read lengths:** reads are 2×250 bp (R1 cut to 241–244 bp by the provider), ~222/231 bp after primer
+  removal. Truncation is set to 220/229 bp, which leaves ~20 bp of overlap on the ~429 bp amplicon.
+""",
+        error_notes="""
+Aggregate quality profiles of the primer-trimmed reads were used to choose the truncation lengths. The read
+headers show an Illumina NovaSeq run (ENA lists MiSeq) with **binned quality scores** (Q 2, 11, 25 and 37 only).
+With so few quality values the default loess fit of the DADA2 error model is poorly constrained, so the fitted
+substitution rates were forced to be non-increasing with quality (`error_function: loess_monotonic`). The
+"swapped" batch in the error-model figure holds only the excluded sample L14 (its two files are the same R1
+reads, so almost no pair carries both primers).
+""",
+        paper_taxa_text="""
+Zhong et al. (LEfSe on the authors' OTU table) report higher *Clostridium*, *Dorea* and *Ruminococcus* in high
+PIPN, more *Sutterella*, *Dialister* and *Ruminococcus* in low PIPN, and Bifidobacteriaceae in healthy controls.
+""",
+        label_notes="""
+The authors' table holds only the 20 most abundant genera (18 shared with SILVA), so single-sample profiles
+discriminate poorly between people. The same-label correlation is still high (mean rho 0.79, vs 0.83 for the best
+match), and 57 of 79 samples best match an authors' sample of the same group. There is no sign of swapped labels.
+""",
+    log: "logs/report/report.log"
+    conda: "envs/report.yaml"
+    script: f"{S}/report.py"
